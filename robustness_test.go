@@ -493,7 +493,9 @@ func TestFrameMalformed(t *testing.T) {
 	}
 }
 
-// Once a Reader fails, it must keep failing until Reset, and then work.
+// Once a Reader fails, it must keep failing with the same error until Reset,
+// and then work. The stored terminal error is returned unchanged, so every
+// later call reports the identical value, never a state-prefixed copy.
 func TestReaderErrorIsSticky(t *testing.T) {
 	valid := encode(t, []byte("some valid data"))
 	for _, tc := range malformedCases(t) {
@@ -502,29 +504,267 @@ func TestReaderErrorIsSticky(t *testing.T) {
 		}
 		for _, conc := range []int{1, 4} {
 			t.Run(fmt.Sprintf("%s/conc%d", tc.name, conc), func(t *testing.T) {
+				// Failure reached through Read.
 				zr := lz4.NewReader(bytes.NewReader(tc.in))
 				if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := io.ReadAll(zr); err == nil {
 					t.Fatal("no error")
-				}
-				buf := make([]byte, 16)
-				for i := range 3 {
-					if _, err := zr.Read(buf); err == nil || err == io.EOF {
-						t.Fatalf("Read %d after failure: err=%v", i, err)
+				} else {
+					for i := range 3 {
+						if n, err := zr.Read(make([]byte, 16)); n != 0 || err == nil || err == io.EOF {
+							t.Fatalf("Read %d after failure: n=%d err=%v", i, n, err)
+						}
 					}
-				}
-				if _, err := zr.WriteTo(io.Discard); err == nil {
-					t.Fatal("WriteTo after failure: no error")
+					if n, err := zr.WriteTo(io.Discard); n != 0 || err == nil {
+						t.Fatalf("WriteTo after failure: n=%d err=%v", n, err)
+					}
 				}
 				zr.Reset(bytes.NewReader(valid))
 				out, err := io.ReadAll(zr)
 				if err != nil || string(out) != "some valid data" {
 					t.Fatalf("after Reset: %q, %v", out, err)
 				}
+
+				// Failure reached through WriteTo: the first error and every
+				// later Read/WriteTo error must be the identical value.
+				zr = lz4.NewReader(bytes.NewReader(tc.in))
+				if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+					t.Fatal(err)
+				}
+				_, first := zr.WriteTo(io.Discard)
+				if first == nil {
+					t.Fatal("WriteTo: no error")
+				}
+				for i := range 3 {
+					if n, err := zr.Read(make([]byte, 16)); n != 0 || err != first {
+						t.Fatalf("Read %d after WriteTo failure: n=%d err=%v, want %v", i, n, err, first)
+					}
+				}
+				if _, err := zr.WriteTo(io.Discard); err != first {
+					t.Fatalf("WriteTo after failure: err=%v, want the identical value %v", err, first)
+				}
+				zr.Reset(bytes.NewReader(valid))
+				out, err = io.ReadAll(zr)
+				if err != nil || string(out) != "some valid data" {
+					t.Fatalf("after Reset: %q, %v", out, err)
+				}
 			})
 		}
+	}
+}
+
+// A destination failure surfaced by WriteTo is sticky in the same way: the
+// raw writer error is stored, not a state-prefixed wrapper, so later calls
+// report the identical value.
+func TestReaderWriteToErrorIsSticky(t *testing.T) {
+	frame := encode(t, bytes.Repeat([]byte("payload "), 10000), lz4.BlockSizeOption(lz4.Block64Kb))
+	for _, conc := range []int{1, 4} {
+		zr := lz4.NewReader(bytes.NewReader(frame))
+		if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+			t.Fatal(err)
+		}
+		destination := brokenWriter(50)
+		_, first := zr.WriteTo(&destination)
+		if first == nil || first.Error() != "broken" {
+			t.Fatalf("first WriteTo: %v", first)
+		}
+		if _, err := zr.Read(make([]byte, 8)); err != first {
+			t.Fatalf("Read after WriteTo failure: %v, want %v", err, first)
+		}
+		if _, err := zr.WriteTo(io.Discard); err != first {
+			t.Fatalf("second WriteTo: %v, want the identical value %v", err, first)
+		}
+	}
+}
+
+// The error classes a hostile or truncated stream can produce must stay
+// distinguishable, through both Read and WriteTo, in both concurrency modes.
+func TestReaderErrorClasses(t *testing.T) {
+	hello := []byte("hello, hello, hello, hello, hello, hello!")
+	comp := compressBlock(t, hello)
+	F := byte(flgV1 | flgIndep)
+	hdr := cat(magic, desc(F, bd64K))
+	allCk := cat(magic, desc(F|flgBlkCk|flgCntCk, bd64K))
+	valid := cat(hdr, compBlock(comp), endMark)
+	for _, tc := range []struct {
+		name string
+		in   []byte
+		want error
+	}{
+		{"truncated/blockData", cat(hdr, le32(uint32(len(comp))), comp[:1]), io.ErrUnexpectedEOF},
+		{"truncated/endMark", cat(hdr, compBlock(comp), endMark[:2]), io.ErrUnexpectedEOF},
+		{"truncated/nextFrame", cat(valid, magic[:3]), io.ErrUnexpectedEOF},
+		{"invalidBlock", cat(hdr, compBlock([]byte{0xF0, 0xFF, 0xFF}), endMark), lz4.ErrInvalidSourceShortBuffer},
+		{"invalidBlockSize", cat(hdr, le32(uint32(lz4.Block64Kb)+1)), lz4.ErrOptionInvalidBlockSize},
+		{"invalidBlockChecksum", cat(allCk, compBlock(comp), le32(xxh32.ChecksumZero(comp)^1), endMark, xxh(hello)), lz4.ErrInvalidBlockChecksum},
+		{"invalidFrameChecksum", cat(allCk, compBlock(comp), xxh(comp), endMark, le32(xxh32.ChecksumZero(hello)^1)), lz4.ErrInvalidFrameChecksum},
+		{"invalidHeaderChecksum", cat(magic, []byte{F, bd64K, desc(F, bd64K)[2] ^ 1}, endMark), lz4.ErrInvalidHeaderChecksum},
+		{"trailingGarbage", cat(valid, []byte{1, 2, 3, 4}), lz4.ErrInvalidFrame},
+		{"badMagic", le32(0x184D2205), lz4.ErrInvalidFrame},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, conc := range []int{1, 4} {
+				for _, viaWriteTo := range []bool{false, true} {
+					zr := lz4.NewReader(bytes.NewReader(tc.in))
+					if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+						t.Fatal(err)
+					}
+					var err error
+					if viaWriteTo {
+						_, err = zr.WriteTo(io.Discard)
+					} else {
+						_, err = io.ReadAll(zr)
+					}
+					if !errors.Is(err, tc.want) {
+						t.Errorf("conc=%d writeTo=%v: got %v, want %v", conc, viaWriteTo, err, tc.want)
+					}
+				}
+			}
+		})
+	}
+}
+
+// In a concatenated stream whose last frame is truncated, the caller must
+// still receive every verified byte of the earlier frames and a prefix of
+// the last one, then ErrUnexpectedEOF; nothing is delivered after it.
+func TestReaderConcatenatedTruncated(t *testing.T) {
+	first := []byte("FIRST FRAME PAYLOAD, first frame payload.")
+	second := bytes.Repeat([]byte("SECOND "), 20000)
+	for _, conc := range []int{1, 4} {
+		for _, checksums := range []bool{false, true} {
+			opts := []lz4.Option{lz4.BlockSizeOption(lz4.Block64Kb), lz4.ConcurrencyOption(conc)}
+			if checksums {
+				opts = append(opts, lz4.BlockChecksumOption(true), lz4.ChecksumOption(true))
+			}
+			f1 := encode(t, first, opts...)
+			f2 := encode(t, second, opts...)
+			stream := append(append([]byte{}, f1...), f2...)
+			want := append(append([]byte{}, first...), second...)
+			t.Run(fmt.Sprintf("conc=%d/checksums=%v", conc, checksums), func(t *testing.T) {
+				// A cut strictly inside the second frame. The cut at the frame
+				// boundary (len(f1)) is a clean end and is covered by
+				// TestFrameTruncated.
+				for cut := len(f1) + 1; cut < len(stream); cut++ {
+					zr := lz4.NewReader(bytes.NewReader(stream[:cut]))
+					if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+						t.Fatal(err)
+					}
+					out, err := io.ReadAll(zr)
+					if !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatalf("cut %d/%d: got %v, want ErrUnexpectedEOF", cut, len(stream), err)
+					}
+					if !bytes.HasPrefix(want, out) || len(out) < len(first) {
+						t.Fatalf("cut %d/%d: delivered %d bytes, want a verified prefix of at least %d", cut, len(stream), len(out), len(first))
+					}
+					if n, e := zr.Read(make([]byte, 16)); n != 0 || e != err {
+						t.Fatalf("cut %d/%d: Read after error: n=%d err=%v, want 0, %v", cut, len(stream), n, e, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// Reset must leave no bytes, dictionary or checksum state of the previous
+// stream behind, whether it was partially read, failed, or never started.
+func TestReaderResetIsolation(t *testing.T) {
+	big := bytes.Repeat([]byte("A"), 10000)
+	f1 := encode(t, big, lz4.BlockSizeOption(lz4.Block64Kb))
+	f2 := encode(t, []byte("NEW STREAM"), lz4.BlockSizeOption(lz4.Block64Kb))
+	for _, conc := range []int{1, 4} {
+		t.Run(fmt.Sprintf("conc=%d", conc), func(t *testing.T) {
+			// Partial read, then Reset.
+			zr := lz4.NewReader(bytes.NewReader(f1))
+			if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(zr, make([]byte, 123)); err != nil {
+				t.Fatal(err)
+			}
+			zr.Reset(bytes.NewReader(f2))
+			if out, err := io.ReadAll(zr); err != nil || string(out) != "NEW STREAM" {
+				t.Fatalf("partial->Reset: %q, %v", out, err)
+			}
+
+			// Error state, then Reset.
+			bad := append(append([]byte{}, f1...), 0, 1, 2) // trailing garbage
+			zr = lz4.NewReader(bytes.NewReader(bad))
+			if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadAll(zr); err == nil {
+				t.Fatal("expected an error on the bad stream")
+			}
+			zr.Reset(bytes.NewReader(f2))
+			if out, err := io.ReadAll(zr); err != nil || string(out) != "NEW STREAM" {
+				t.Fatalf("error->Reset: %q, %v", out, err)
+			}
+
+			// Never read, then Reset.
+			zr = lz4.NewReader(bytes.NewReader(f1))
+			if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+				t.Fatal(err)
+			}
+			zr.Reset(bytes.NewReader(f2))
+			if out, err := io.ReadAll(zr); err != nil || string(out) != "NEW STREAM" {
+				t.Fatalf("fresh->Reset: %q, %v", out, err)
+			}
+		})
+	}
+}
+
+// Empty frames, frames ending exactly at EOF, and reads after clean EOF must
+// be stable across buffer sizes and concurrency levels.
+func TestReaderEmptyAndEOFStable(t *testing.T) {
+	empty := encode(t, nil)
+	withData := encode(t, []byte("DATA"))
+	for _, tc := range []struct {
+		name string
+		in   []byte
+		want []byte
+	}{
+		{"nil", nil, nil},
+		{"empty", empty, nil},
+		{"empty+empty", append(append([]byte{}, empty...), empty...), nil},
+		{"empty+data", append(append([]byte{}, empty...), withData...), []byte("DATA")},
+		{"data+empty", append(append([]byte{}, withData...), empty...), []byte("DATA")},
+		{"data+data", append(append([]byte{}, withData...), withData...), []byte("DATADATA")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, conc := range []int{1, 4} {
+				for _, bufSize := range []int{1, 4, 64} {
+					zr := lz4.NewReader(bytes.NewReader(tc.in))
+					if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+						t.Fatal(err)
+					}
+					var got []byte
+					buf := make([]byte, bufSize)
+					for {
+						n, err := zr.Read(buf)
+						got = append(got, buf[:n]...)
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							t.Fatalf("conc=%d buf=%d: %v", conc, bufSize, err)
+						}
+					}
+					if !bytes.Equal(got, tc.want) {
+						t.Fatalf("conc=%d buf=%d: got %q, want %q", conc, bufSize, got, tc.want)
+					}
+					for i := range 3 {
+						if n, err := zr.Read(buf); n != 0 || err != io.EOF {
+							t.Fatalf("post-EOF Read %d: n=%d err=%v, want 0, EOF", i, n, err)
+						}
+					}
+					if n, err := zr.WriteTo(io.Discard); n != 0 || err != io.EOF {
+						t.Fatalf("post-EOF WriteTo: n=%d err=%v, want 0, EOF", n, err)
+					}
+				}
+			}
+		})
 	}
 }
 

@@ -89,6 +89,10 @@ func (f *Frame) isLegacy() bool {
 	return f.Magic == frameMagicLegacy
 }
 
+// IsLegacy reports whether f is a legacy frame, which has no descriptor or
+// end mark and simply ends with the source.
+func (f *Frame) IsLegacy() bool { return f.isLegacy() }
+
 // BlockSizeIndex returns the block size of the frame; legacy frames
 // have no descriptors and return 8Mb.
 func (f *Frame) BlockSizeIndex() lz4block.BlockSizeIndex {

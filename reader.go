@@ -80,6 +80,17 @@ func (r *Reader) isNotConcurrent() bool {
 	return r.num == 1
 }
 
+// frameEndEOF reports how a frame ending right at the end of the source
+// terminates the stream: a legacy frame has no end mark and simply stops,
+// while a non-legacy frame truncated before its next frame or end mark is an
+// error rather than a clean end.
+func (r *Reader) frameEndEOF() error {
+	if r.frame.IsLegacy() {
+		return nil
+	}
+	return io.ErrUnexpectedEOF
+}
+
 func (r *Reader) init() error {
 	if len(r.dict) > 0 {
 		r.num = 1
@@ -153,7 +164,11 @@ func (r *Reader) Read(buf []byte) (n int, err error) {
 
 				goto read
 			case io.EOF:
+				// The source ended before this frame's end mark: fine for a
+				// legacy frame, a truncated non-legacy frame otherwise.
 				if er := r.frame.CloseR(r.src); er != nil {
+					err = er
+				} else if er := r.frameEndEOF(); er != nil {
 					err = er
 				}
 				lz4block.Put(r.data)
@@ -312,7 +327,11 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 			}
 			goto read
 		case io.EOF:
-			err = r.frame.CloseR(r.src)
+			if er := r.frame.CloseR(r.src); er != nil {
+				err = er
+			} else {
+				err = r.frameEndEOF()
+			}
 			return
 		default:
 			return
