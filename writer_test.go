@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -266,6 +267,11 @@ func (w *flushBlockingWriter) Write(p []byte) (int, error) {
 	return w.Buffer.Write(p)
 }
 
+// TestWriterFlushBufferOwnership verifies the Flush barrier in concurrent
+// mode: Flush does not return until the block it flushed has reached the
+// destination, and the Writer can keep accepting blocks afterwards. Earlier
+// Flush only queued the block, so the pending block's buffer could be handed
+// out again and overwritten by the next Write.
 func TestWriterFlushBufferOwnership(t *testing.T) {
 	for _, concurrency := range []int{2, 4} {
 		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
@@ -280,17 +286,30 @@ func TestWriterFlushBufferOwnership(t *testing.T) {
 			if _, err := zw.Write(first); err != nil {
 				t.Fatal(err)
 			}
-			if err := zw.Flush(); err != nil {
-				t.Fatal(err)
-			}
+
+			flushed := make(chan error, 1)
+			go func() { flushed <- zw.Flush() }()
+			// The flush must reach the block write itself.
 			select {
 			case <-out.entered:
 			case <-time.After(5 * time.Second):
 				close(out.release)
 				t.Fatal("timed out waiting for block write")
 			}
-			n, err := zw.Write(second)
+			// It must not return while that write is still blocked.
+			select {
+			case err := <-flushed:
+				close(out.release)
+				t.Fatalf("Flush returned before the block finished writing: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
 			close(out.release)
+			if err := <-flushed; err != nil {
+				t.Fatal(err)
+			}
+
+			// Writes after the barrier start a fresh, owned buffer.
+			n, err := zw.Write(second)
 			if err != nil || n != len(second) {
 				t.Fatalf("Write: got (%d, %v), want (%d, nil)", n, err, len(second))
 			}
@@ -377,34 +396,46 @@ func TestWriterFlushError(t *testing.T) {
 	for _, concurrency := range []int{1, 2, 4} {
 		for _, failAt := range []int{2, 3} {
 			t.Run(fmt.Sprintf("concurrency=%d/failAt=%d", concurrency, failAt), func(t *testing.T) {
-				zw := lz4.NewWriter(&flushErrorWriter{failAt: failAt})
+				out := &flushErrorWriter{failAt: failAt}
+				zw := lz4.NewWriter(out)
 				if err := zw.Apply(lz4.ConcurrencyOption(concurrency), lz4.BlockSizeOption(lz4.Block64Kb)); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := zw.Write([]byte("first block")); err != nil {
 					t.Fatal(err)
 				}
-				err := zw.Flush()
-				if concurrency == 1 {
-					if err != io.ErrClosedPipe {
-						t.Fatalf("Flush: got %v, want %v", err, io.ErrClosedPipe)
-					}
-					zw.Reset(io.Discard)
-					return
+				// Flush is a barrier: it surfaces the first write error at
+				// every concurrency level instead of deferring it to Close.
+				if err := zw.Flush(); err != io.ErrClosedPipe {
+					t.Fatalf("Flush: got %v, want %v", err, io.ErrClosedPipe)
 				}
-				if err != nil {
+				// The error is sticky: every later operation reports it,
+				// without rewriting the block that already failed.
+				failedWrites := out.writes
+				if _, err := zw.Write([]byte("next block")); !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("Write after the error: got %v, want %v", err, io.ErrClosedPipe)
+				}
+				if err := zw.Flush(); !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("Flush after the error: got %v, want %v", err, io.ErrClosedPipe)
+				}
+				if err := zw.Close(); !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("Close after the error: got %v, want %v", err, io.ErrClosedPipe)
+				}
+				// Close is idempotent and bounded: a second call neither
+				// retries the flush nor appends anything.
+				if err := zw.Close(); !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("second Close: got %v, want %v", err, io.ErrClosedPipe)
+				}
+				if out.writes != failedWrites {
+					t.Fatalf("the failed frame was retried: writes went from %d to %d", failedWrites, out.writes)
+				}
+				// Reset clears the sticky state and the Writer works again.
+				zw.Reset(io.Discard)
+				if _, err := zw.Write([]byte("fresh block")); err != nil {
 					t.Fatal(err)
 				}
-				for range 8 {
-					if _, err := zw.Write([]byte("next block")); err != nil {
-						t.Fatal(err)
-					}
-					if err := zw.Flush(); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := zw.Close(); err != io.ErrClosedPipe {
-					t.Fatalf("Close: got %v, want %v", err, io.ErrClosedPipe)
+				if err := zw.Close(); err != nil {
+					t.Fatal(err)
 				}
 			})
 		}
@@ -1257,4 +1288,214 @@ func TestWriterReadFromWriteError(t *testing.T) {
 		t.Fatalf("Close after the error: got %v, want %v", err, io.ErrClosedPipe)
 	}
 	zw.Reset(io.Discard)
+}
+
+// TestWriterConcurrentCalls exercises Write, Flush and Close being issued from
+// several goroutines at once. The calls are serialized inside the Writer, so
+// the frame must still decompress to the concatenation of every input and the
+// race detector must not find a data race.
+func TestWriterConcurrentCalls(t *testing.T) {
+	for _, concurrency := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			var out bytes.Buffer
+			zw := lz4.NewWriter(&out)
+			if err := zw.Apply(lz4.ConcurrencyOption(concurrency), lz4.BlockSizeOption(lz4.Block64Kb)); err != nil {
+				t.Fatal(err)
+			}
+
+			const goroutines, perGoroutine, chunk = 6, 40, 700
+			var want bytes.Buffer
+			var wg sync.WaitGroup
+			errs := make(chan error, goroutines)
+			wg.Add(goroutines)
+			for g := 0; g < goroutines; g++ {
+				g := g
+				go func() {
+					defer wg.Done()
+					for i := 0; i < perGoroutine; i++ {
+						data := bytes.Repeat([]byte{byte('A' + g)}, chunk)
+						if n, err := zw.Write(data); err != nil || n != len(data) {
+							errs <- fmt.Errorf("Write: (%d, %v), want (%d, nil)", n, err, len(data))
+							return
+						}
+						if i%7 == 0 {
+							if err := zw.Flush(); err != nil {
+								errs <- fmt.Errorf("Flush: %v", err)
+								return
+							}
+						}
+					}
+				}()
+			}
+			// The expected payload depends only on the bytes, not their order.
+			for g := 0; g < goroutines; g++ {
+				for i := 0; i < perGoroutine; i++ {
+					want.Write(bytes.Repeat([]byte{byte('A' + g)}, chunk))
+				}
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Error(err)
+			}
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := io.ReadAll(lz4.NewReader(&out))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCounts := make([]int, 26)
+			gotCounts := make([]int, 26)
+			for _, b := range want.Bytes() {
+				wantCounts[b-'A']++
+			}
+			for _, b := range got {
+				gotCounts[b-'A']++
+			}
+			if !reflect.DeepEqual(gotCounts, wantCounts) || len(got) != want.Len() {
+				t.Fatalf("frame lost or duplicated bytes: got %d bytes, want %d", len(got), want.Len())
+			}
+		})
+	}
+}
+
+// failEndMarkWriter accepts the descriptor and the data blocks and only fails
+// the last write of Close (the frame end mark together with the content
+// checksum), so every committed block is already intact when it fails.
+type failEndMarkWriter struct {
+	flushErrorWriter
+	buf bytes.Buffer
+}
+
+func newFailEndMarkWriter() *failEndMarkWriter {
+	// Descriptor = write 1, block header = write 2, block data = write 3;
+	// only Close's end mark + checksum write (4) fails.
+	return &failEndMarkWriter{flushErrorWriter: flushErrorWriter{failAt: 4}}
+}
+
+func (w *failEndMarkWriter) Write(p []byte) (int, error) {
+	if n, err := w.flushErrorWriter.Write(p); err != nil {
+		// Keep the failed end mark out of the recorded frame.
+		return n, err
+	}
+	return w.buf.Write(p)
+}
+
+func (w *failEndMarkWriter) Len() int { return w.buf.Len() }
+
+func (w *failEndMarkWriter) Bytes() []byte { return w.buf.Bytes() }
+
+// TestWriterCloseEndMarkError checks that a failure while closing the frame is
+// reported once, leaves a sticky error, never fakes success and does not
+// re-emit committed blocks on the next Close.
+func TestWriterCloseEndMarkError(t *testing.T) {
+	out := newFailEndMarkWriter()
+	zw := lz4.NewWriter(out)
+	if err := zw.Apply(lz4.ChecksumOption(true)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := zw.Write([]byte("committed block")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	frameAtError := out.Len()
+	if err := zw.Close(); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Close: got %v, want %v", err, io.ErrClosedPipe)
+	}
+	if err := zw.Close(); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("second Close: got %v, want %v", err, io.ErrClosedPipe)
+	}
+	if out.Len() != frameAtError {
+		t.Fatalf("Close rewrote the frame: %d bytes before the error, %d after", frameAtError, out.Len())
+	}
+	if n, err := zw.Write([]byte("late")); n != 0 || !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Write after a failed Close: n=%d err=%v", n, err)
+	}
+	// The unfinished frame must not be mistaken for a success.
+	if _, err := io.ReadAll(lz4.NewReader(bytes.NewReader(out.Bytes()))); err == nil {
+		t.Fatal("the truncated frame decoded without an error")
+	}
+	zw.Reset(io.Discard)
+}
+
+// TestWriterZeroWrite checks that empty writes never emit a block and never
+// fail, including when they are the only input a frame ever receives.
+func TestWriterZeroWrite(t *testing.T) {
+	for _, concurrency := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			var out bytes.Buffer
+			zw := lz4.NewWriter(&out)
+			if err := zw.Apply(lz4.ConcurrencyOption(concurrency), lz4.BlockSizeOption(lz4.Block64Kb)); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := zw.Write(nil); err != nil || n != 0 {
+				t.Fatalf("Write(nil): got (%d, %v), want (0, nil)", n, err)
+			}
+			if n, err := zw.Write([]byte{}); err != nil || n != 0 {
+				t.Fatalf("Write(empty): got (%d, %v), want (0, nil)", n, err)
+			}
+			if err := zw.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			data := []byte("real data")
+			if n, err := zw.Write(data); err != nil || n != len(data) {
+				t.Fatalf("Write: got (%d, %v), want (%d, nil)", n, err, len(data))
+			}
+			if err := zw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(lz4.NewReader(&out))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatalf("got %q, want %q: empty writes produced block content", got, data)
+			}
+		})
+	}
+}
+
+// TestWriterErrorDoesNotDuplicateBlock forces a write failure while a block is
+// in flight and checks that the failing block is submitted once: after the
+// sticky error no further block is queued, so the manager never outputs the
+// same uncompressed bytes twice.
+func TestWriterErrorDoesNotDuplicateBlock(t *testing.T) {
+	for _, concurrency := range []int{1, 2, 4} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			// The descriptor is write #1 and the first data block write #2.
+			out := &flushErrorWriter{failAt: 2}
+			zw := lz4.NewWriter(out)
+			if err := zw.Apply(lz4.ConcurrencyOption(concurrency), lz4.BlockSizeOption(lz4.Block64Kb)); err != nil {
+				t.Fatal(err)
+			}
+			payload := bytes.Repeat([]byte("block payload "), 500)
+			if _, err := zw.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			if err := zw.Flush(); !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("Flush: got %v, want %v", err, io.ErrClosedPipe)
+			}
+			writesAtFailure := out.writes
+			// All of these are rejected by the sticky state and reach nothing.
+			for range 4 {
+				if _, err := zw.Write(payload); !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("Write after the error: got %v, want %v", err, io.ErrClosedPipe)
+				}
+				if err := zw.Flush(); !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("Flush after the error: got %v, want %v", err, io.ErrClosedPipe)
+				}
+			}
+			if err := zw.Close(); !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("Close: got %v, want %v", err, io.ErrClosedPipe)
+			}
+			if out.writes != writesAtFailure {
+				t.Fatalf("the committed block was rewritten: writes %d -> %d", writesAtFailure, out.writes)
+			}
+			zw.Reset(io.Discard)
+		})
+	}
 }

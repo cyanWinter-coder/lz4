@@ -3,6 +3,7 @@ package lz4
 import (
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
 	"github.com/pierrec/lz4/v4/internal/lz4errors"
@@ -27,7 +28,12 @@ func NewWriter(w io.Writer) *Writer {
 }
 
 // Writer allows writing an LZ4 stream.
+//
+// Write, ReadFrom, Flush, Close, Reset and Apply are safe for concurrent use;
+// a call holds a single lock for its duration, so two calls are serialized,
+// never interleaved.
 type Writer struct {
+	mu         sync.Mutex
 	state      _State
 	src        io.Writer                 // destination writer
 	level      lz4block.CompressionLevel // how hard to try
@@ -44,6 +50,8 @@ type Writer struct {
 func (*Writer) private() {}
 
 func (w *Writer) Apply(options ...Option) (err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	defer w.state.check(&err)
 	switch w.state.state {
 	case newState:
@@ -52,7 +60,7 @@ func (w *Writer) Apply(options ...Option) (err error) {
 	default:
 		return lz4errors.ErrOptionClosedOrError
 	}
-	w.Reset(w.src)
+	w.reset(w.src)
 	for _, o := range options {
 		if err = o(w); err != nil {
 			return
@@ -85,7 +93,13 @@ func (w *Writer) init() error {
 	return w.frame.Descriptor.Write(w.frame, w.src)
 }
 
+// Write implements io.Writer. It only ever hands data it owns to the
+// compressor: a full block is passed without a copy when the compression is
+// synchronous (concurrency 1) and the call returns before the caller may reuse
+// buf; every other path copies buf into a Writer-owned buffer first.
 func (w *Writer) Write(buf []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.state.state == closedState {
 		return 0, lz4errors.ErrWriterClosed
 	}
@@ -105,7 +119,9 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 	zn := len(w.data)
 	for len(buf) > 0 {
 		if w.isNotConcurrent() && w.idx == 0 && len(buf) >= zn {
-			// Avoid a copy as there is enough data for a block.
+			// Avoid a copy as there is enough data for a block. The
+			// compression is synchronous, so the block is fully written before
+			// Write returns and the caller may reuse buf.
 			if err = w.write(buf[:zn], false); err != nil {
 				return
 			}
@@ -137,6 +153,10 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 	return
 }
 
+// write compresses data and submits the resulting block. In concurrent mode it
+// returns as soon as the block is queued: the block is written to the
+// destination in submission order by a manager goroutine, and Flush or Close
+// acts as a barrier that waits for it.
 func (w *Writer) write(data []byte, safe bool) error {
 	if w.isNotConcurrent() {
 		block := w.frame.Blocks.Block
@@ -144,8 +164,7 @@ func (w *Writer) write(data []byte, safe bool) error {
 		w.handler(len(block.Data))
 		return err
 	}
-	c := make(chan *lz4stream.FrameDataBlock)
-	w.frame.Blocks.Blocks <- c
+	c := w.frame.Blocks.Submit()
 	go func(c chan *lz4stream.FrameDataBlock, data []byte, safe bool) {
 		b := lz4stream.NewFrameDataBlock(w.frame)
 		b.Compress(w.frame, data, w.level)
@@ -164,8 +183,20 @@ func (w *Writer) write(data []byte, safe bool) error {
 	return nil
 }
 
-// Flush any buffered data to the underlying writer immediately.
+// Flush establishes a barrier: when it returns nil, all data written before
+// the call has been compressed and handed to the underlying writer, and data
+// written afterwards starts a new block. It returns the first error that
+// reached the underlying writer; once that happens the Writer is in a sticky
+// error state and every later Write, ReadFrom, Flush or Close fails with the
+// same error until Reset.
 func (w *Writer) Flush() (err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.state.state == closedState {
+		// A closed writer has nothing left to flush.
+		return nil
+	}
+	defer w.state.check(&err)
 	switch w.state.state {
 	case writeState:
 	case errorState:
@@ -188,24 +219,85 @@ func (w *Writer) Flush() (err error) {
 		}
 		w.idx = 0
 	}
-	return nil
+	// Wait for every queued block to reach the destination and surface its
+	// error: a Flush is a barrier, not merely a queue insertion.
+	return w.frame.Blocks.BarrierW()
 }
 
 // Close closes the Writer, flushing any unwritten data to the underlying writer
-// without closing it.
+// without closing it. Close is bounded and idempotent: a second call does not
+// re-flush or rewrite committed blocks and returns the first call's result.
+// After an error the frame is torn down and the block buffers released before
+// the sticky error is returned, without forging an end mark or success.
 func (w *Writer) Close() error {
-	if w.state.state == closedState {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	switch w.state.state {
+	case closedState:
 		return nil
+	case errorState:
+		// Tear down whatever the failing call left behind and keep reporting
+		// the sticky error; the frame is already invalid, so nothing is written.
+		w.teardown()
+		return w.state.err
 	}
-	if err := w.Flush(); err != nil {
+
+	// A frame with no Write or Flush yet still needs its descriptor.
+	if w.state.state == newState {
+		if err := w.init(); err != nil {
+			w.teardown()
+			w.state.next(err)
+			return err
+		}
+		w.state.next(nil)
+	}
+
+	err := w.flushLocked()
+	if err == nil {
+		err = w.frame.CloseW(w.src, w.num)
+	}
+	if err != nil {
+		// Drain in-flight compression goroutines and release the buffers; do
+		// not write the end mark of a frame whose blocks already failed.
+		w.teardown()
+		w.state.next(err)
+		// Return the original error; the sticky copy in w.state is wrapped
+		// but preserves it through errors.Is.
 		return err
 	}
-	err := w.frame.CloseW(w.src, w.num)
 	// It is now safe to free the buffer.
 	lz4block.Put(w.data)
 	w.data = nil
-	w.state.next(err)
-	return err
+	w.state.next(nil)
+	return nil
+}
+
+// flushLocked emits the pending block, if any, and waits for every queued
+// block to reach the destination, returning the first write error. The caller
+// holds w.mu and the Writer must be in writeState.
+func (w *Writer) flushLocked() error {
+	if w.idx > 0 {
+		if err := w.write(w.data[:w.idx], true); err != nil {
+			return err
+		}
+		if !w.isNotConcurrent() {
+			size := w.frame.Descriptor.Flags.BlockSizeIndex()
+			w.data = size.Get()
+		}
+		w.idx = 0
+	}
+	return w.frame.Blocks.BarrierW()
+}
+
+// teardown stops the frame machinery and returns w.data to the pool. It is
+// safe to call repeatedly and without a prior successful Close.
+func (w *Writer) teardown() {
+	w.frame.Reset(w.num)
+	if w.data != nil {
+		lz4block.Put(w.data)
+		w.data = nil
+	}
+	w.idx = 0
 }
 
 // Reset clears the state of the Writer w such that it is equivalent to its
@@ -215,9 +307,15 @@ func (w *Writer) Close() error {
 //
 // w.Close must be called before Reset or pending data may be dropped.
 func (w *Writer) Reset(writer io.Writer) {
-	lz4block.Put(w.data)
-	w.data = nil
-	w.frame.Reset(w.num)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.reset(writer)
+}
+
+// reset is the lock-free part of Reset; the caller holds w.mu (or the Writer
+// is still under construction).
+func (w *Writer) reset(writer io.Writer) {
+	w.teardown()
 	w.state.reset()
 	w.src = writer
 }
@@ -226,6 +324,8 @@ func (w *Writer) Reset(writer io.Writer) {
 // Writer destination. As with Write, data that does not fill a block stays
 // buffered until the next Write, ReadFrom, Flush or Close.
 func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	switch w.state.state {
 	case writeState:
 	case closedState:

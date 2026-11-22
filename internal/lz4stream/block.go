@@ -13,9 +13,20 @@ import (
 
 type Blocks struct {
 	Block  *FrameDataBlock
-	Blocks chan chan *FrameDataBlock
-	reader *asyncReader // in flight if concurrency > 1, nil otherwise
+	jobs   chan writeJob // in-flight compression results and barriers; nil in non concurrent mode
+	reader *asyncReader  // in flight if concurrency > 1, nil otherwise
 	err    error
+}
+
+// writeJob is one item of the concurrent write queue. A block job carries the
+// channel on which its compression goroutine hands over the compressed block;
+// the manager closes it once the block has been written (or skipped after an
+// error). A barrier job carries no reply channel: once the manager reaches
+// it, every block queued before the barrier has reached the destination, and
+// the first write error (if any) is reported back on done.
+type writeJob struct {
+	reply chan *FrameDataBlock // block jobs only; nil for a barrier
+	done  chan error           // barrier jobs only
 }
 
 // asyncReader reads one frame with concurrency > 1. A Reset can
@@ -56,18 +67,26 @@ var errAbandoned = lz4errors.Error("lz4: concurrent read abandoned")
 
 func (b *Blocks) initW(f *Frame, dst io.Writer, num int) {
 	if num == 1 {
-		b.Blocks = nil
+		b.jobs = nil
 		b.Block = b.Block.init(f)
 		return
 	}
 	b.Block = nil
-	if cap(b.Blocks) != num {
-		b.Blocks = make(chan chan *FrameDataBlock, num)
+	if cap(b.jobs) != num {
+		b.jobs = make(chan writeJob, num)
 	}
 	// goroutine managing concurrent block compression goroutines.
 	go func() {
 		// Process next block compression item.
-		for c := range b.Blocks {
+		for j := range b.jobs {
+			if j.reply == nil {
+				// A barrier: all earlier blocks have been written. Report the
+				// first error, if any, so the caller may continue or fail.
+				j.done <- b.err
+				close(j.done)
+				continue
+			}
+			c := j.reply
 			// Read the next compressed block result.
 			// Waiting here ensures that the blocks are output in the order they were sent.
 			// The incoming channel is always closed as it indicates to the caller that
@@ -93,6 +112,27 @@ func (b *Blocks) initW(f *Frame, dst io.Writer, num int) {
 	}()
 }
 
+// Submit queues a compressed block, to be written in submission order. The
+// compression goroutine sends the block on the returned channel and waits for
+// it to be closed before releasing its source buffer.
+func (b *Blocks) Submit() chan *FrameDataBlock {
+	c := make(chan *FrameDataBlock)
+	b.jobs <- writeJob{reply: c}
+	return c
+}
+
+// BarrierW waits until all the blocks queued before it have been written (or
+// skipped after an error), and returns the first write error encountered.
+// It is a no-op in non concurrent mode, where writes are synchronous.
+func (b *Blocks) BarrierW() error {
+	if b.jobs == nil {
+		return b.err
+	}
+	done := make(chan error, 1)
+	b.jobs <- writeJob{done: done}
+	return <-done
+}
+
 // StopR abandons a concurrent read and waits until its goroutines no longer
 // use the source, so the caller may reuse it.
 func (b *Blocks) StopR() {
@@ -116,16 +156,16 @@ func (b *Blocks) close(f *Frame, num int) error {
 		b.err = nil
 		return err
 	}
-	if b.Blocks == nil {
+	if b.jobs == nil {
 		err := b.err
 		b.err = nil
 		return err
 	}
 	c := make(chan *FrameDataBlock)
-	b.Blocks <- c
-	c <- nil
-	<-c
-	b.Blocks = nil // ensure a second close from Reset does not block
+	b.jobs <- writeJob{reply: c}
+	c <- nil     // signal the manager to stop
+	<-c          // wait for it to finish processing every queued block
+	b.jobs = nil // ensure a second close from Reset does not block
 	err := b.err
 	b.err = nil
 	return err
@@ -147,7 +187,7 @@ func (b *Blocks) ErrorR() error {
 func (b *Blocks) initR(f *Frame, num int, src io.Reader) (chan []byte, error) {
 	size := f.BlockSizeIndex()
 	if num == 1 {
-		b.Blocks = nil
+		b.jobs = nil
 		b.Block = b.Block.init(f)
 		return nil, nil
 	}

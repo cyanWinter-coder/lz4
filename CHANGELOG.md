@@ -24,6 +24,17 @@ issues in this repository.
 
 ### Fixed
 
+- `Writer` is safe for concurrent use: `Write`, `ReadFrom`, `Flush`, `Close`,
+  `Reset` and `Apply` are serialized by an internal lock, so concurrent calls
+  can no longer split a block, submit the same block twice or return a block
+  buffer to the pool while compression still uses it.
+- `Writer.Flush` is now a barrier at every concurrency level: it returns only
+  after every earlier block has reached the underlying writer and surfaces the
+  first write error instead of deferring it to `Close`. An error puts the
+  `Writer` in a sticky error state where every later operation fails with the
+  same error until `Reset`, and the failed frame is torn down without a forged
+  end mark or a rewritten block. `Close` is bounded and idempotent: a second
+  call never re-flushes and returns the first call's result.
 - `Writer.ReadFrom`, which `io.Copy` and `io.CopyN` use, works after `Write` or
   an earlier `ReadFrom`; it failed with `unhandled state[writeState]`. Like
   `Write`, it now keeps a partial block buffered until the next call, `Flush`
