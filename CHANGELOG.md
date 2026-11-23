@@ -15,6 +15,17 @@ issues in this repository.
 
 ### Added
 
+- `StreamPipe` returns two `PipeEnd` peers forming one in-memory, bidirectional
+  LZ4 stream: data written to one end is compressed and read back decompressed
+  from the other. Both ends share one lifecycle with a single cancellation
+  signal while each direction keeps its own real write and decompression error;
+  the first failure becomes a terminal state that wakes both ends, and every
+  later `Read`, `Write` or `Close` returns it unchanged. A graceful `Close`
+  finishes and drains its frame before the peer sees `io.EOF`, a failure or a
+  reached deadline wakes whichever end is blocked, and concurrent or repeated
+  `Close` releases the goroutines and buffers once, which `PipeEnd.Wait` joins.
+  `PipeEnd` is an `io.ReadWriteCloser` with read and write deadlines; the
+  options given to `StreamPipe` are the usual frame `Option` values.
 - `DictionaryOption` sets a preset dictionary for `Writer`, `CompressingReader`
   and `Reader`, and `CompressBlockWithDict`, as a function and a `Compressor`
   method, compresses a block with one. Compressing with a dictionary supports
