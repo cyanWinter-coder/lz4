@@ -2,7 +2,6 @@ package lz4
 
 import (
 	"errors"
-	"fmt"
 	"io"
 
 	"github.com/pierrec/lz4/v4/internal/lz4errors"
@@ -38,14 +37,22 @@ func (s *_State) reset() {
 	s.err = nil
 }
 
+// end marks the object as fully consumed, which is not an error: Read and
+// WriteTo report io.EOF, and other calls behave as they do when closed.
+func (s *_State) end() {
+	s.state = closedState
+	s.err = io.EOF
+}
+
 // next sets the state to the next one unless it is passed a non-nil error.
-// It returns whether it is in error.
+// It returns whether it is in error. The error is stored unchanged, so every
+// call after the first failure reports the same terminal error.
 func (s *_State) next(err error) bool {
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			s.err = io.EOF
 		} else {
-			s.err = fmt.Errorf("%s: %w", s.state, err)
+			s.err = err
 		}
 		s.state = errorState
 		return true
@@ -59,23 +66,25 @@ func (s *_State) nextd(errp *error) bool {
 	return errp != nil && s.next(*errp)
 }
 
-// check sets s in error if not already in error and if the error is not nil or io.EOF,
+// check sets s in error if not already in error and if the error is not nil.
+// The error is stored unchanged, so every call after the first failure
+// reports the same terminal error.
 func (s *_State) check(errp *error) {
-	if s.state == errorState || errp == nil {
+	if s.state == errorState || s.state == closedState || errp == nil {
 		return
 	}
 	if err := *errp; err != nil {
 		if errors.Is(err, io.EOF) {
 			s.err = io.EOF
 		} else {
-			s.err = fmt.Errorf("%w[%s]", err, s.state)
+			s.err = err
 		}
 		s.state = errorState
 	}
 }
 
 func (s *_State) fail() error {
-	s.err = fmt.Errorf("%w[%s]", lz4errors.ErrInternalUnhandledState, s.state)
+	s.err = lz4errors.ErrInternalUnhandledState
 	s.state = errorState
 	return s.err
 }

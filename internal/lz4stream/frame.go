@@ -43,13 +43,16 @@ func unexpectedEOF(err error) error {
 }
 
 // Reset allows reusing the Frame.
-// The Descriptor configuration is not modified.
+// The Descriptor configuration is not modified; the flags of a legacy frame
+// are cleared when its (absent) descriptor is read.
 func (f *Frame) Reset(num int) {
 	f.Magic = 0
 	f.Descriptor.Checksum = 0
 	f.Descriptor.ContentSize = 0
 	_ = f.Blocks.close(f, num)
 	f.Checksum = 0
+	f.checksum.Reset()
+	f.size = 0
 }
 
 func (f *Frame) InitW(dst io.Writer, num int, legacy bool) {
@@ -88,6 +91,10 @@ func (f *Frame) CloseW(dst io.Writer, num int) error {
 func (f *Frame) isLegacy() bool {
 	return f.Magic == frameMagicLegacy
 }
+
+// IsLegacy reports whether f is a legacy frame, which has no descriptor or
+// end mark and simply ends with the source.
+func (f *Frame) IsLegacy() bool { return f.isLegacy() }
 
 // BlockSizeIndex returns the block size of the frame; legacy frames
 // have no descriptors and return 8Mb.

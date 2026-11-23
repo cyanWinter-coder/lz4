@@ -36,6 +36,20 @@ issues in this repository.
   so the caller may reuse it (#292).
 - Concurrent `Reader.WriteTo` recycles its block buffers, including after a
   decode error (#290).
+- `Reader` checks each frame's descriptor, block checksums, content size and
+  end mark against that frame alone, so a damaged frame in the middle of a
+  stream is reported instead of being silently resynchronised. A frame that
+  ends in the middle fails with `io.ErrUnexpectedEOF` (or the more specific
+  checksum or content-size error) and the `Reader` stays failed until `Reset`,
+  so the bytes after a truncated frame are never decoded as a new one. The
+  stored error is now the original value: later calls return the identical
+  error, without a `readState:`-style prefix.
+- `Reader.Reset` rebuilds the frame state from the new stream: it clears the
+  current frame's checksum, content size and concurrency decision, and drops
+  the data that dependent blocks accumulated, keeping only the dictionary from
+  `DictionaryOption`.
+- After the whole stream has been read, `Reader.Read` and `Reader.WriteTo`
+  report `io.EOF` on every later call rather than re-entering the reader.
 
 ### Changed
 
