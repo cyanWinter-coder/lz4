@@ -92,7 +92,16 @@ func countMatch(r srcReader, src []byte, in, match, limit int) int {
 // CompressBlock compresses src into dst with the given acceleration, as
 // LZ4_compress_fast_extState does. It returns 0 if the result does not fit
 // in dst, which cannot happen if len(dst) >= CompressBlockBound(len(src)).
+//
+// As in the C implementation, a destination that is too small is reported as
+// (0, nil), not as an error: the caller must treat a zero size as "retry with
+// a buffer of CompressBlockBound(len(src))". The Go-native Compressor and
+// CompressorHC return a *lz4errors.ShortBufferError instead. Overlapping src
+// and dst are rejected before any write.
 func (c *CompressorCCompat) CompressBlock(src, dst []byte, acceleration int) (int, error) {
+	if err := checkCompressArgs(src, dst, nil); err != nil {
+		return 0, err
+	}
 	if acceleration < 1 {
 		acceleration = 1
 	} else if acceleration > accelerationMax {

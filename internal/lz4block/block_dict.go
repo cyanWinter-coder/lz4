@@ -52,6 +52,9 @@ func CompressBlockWithDict(src, dst, dict []byte) (int, error) {
 // It uses its own loop so that CompressBlock, the common case, does not pay
 // for the dictionary.
 func (c *Compressor) CompressBlockWithDict(src, dst, dict []byte) (int, error) {
+	if err := checkCompressArgs(src, dst, dict); err != nil {
+		return 0, err
+	}
 	c.initDict(dict)
 	if len(c.dict) == 0 {
 		return c.CompressBlock(src, dst)
@@ -78,10 +81,11 @@ func (c *Compressor) dictPos(h uint32, si int, x uint32) (int, bool) {
 func (c *Compressor) compressBlockDict(src, dst []byte) (_ int, err error) {
 	// As in compressBlockHC, a short dst is caught by bounds checks and
 	// recovered here. Cap it so that copies cannot reslice past its length.
-	defer recoverBlock(&err)
+	bound := CompressBlockBound(len(src))
+	defer recoverBounds(&err, len(dst), bound)
 	dst = dst[:len(dst):len(dst)]
 	c.reset()
-	isNotCompressible := len(dst) < CompressBlockBound(len(src))
+	isNotCompressible := len(dst) < bound
 	const adaptSkipLog = 7
 	dict := c.dict
 

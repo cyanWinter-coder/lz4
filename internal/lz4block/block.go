@@ -26,13 +26,34 @@ const (
 	mfLimit = 10 + minMatch // The last match cannot start within the last 14 bytes.
 )
 
-func recoverBlock(e *error) {
+// recoverBounds turns an out-of-bounds panic, raised when a write runs past
+// the destination, into the structured short-buffer error. need is the
+// guaranteed-sufficient size; zero means it is not known at the call site.
+func recoverBounds(e *error, dstLen, need int) {
 	if r := recover(); r != nil && *e == nil {
-		*e = lz4errors.ErrInvalidSourceShortBuffer
+		*e = &lz4errors.ShortBufferError{Have: dstLen, Need: need}
 	}
 }
 
-// blockHash hashes the lower 6 bytes into a value < htSize.
+// shortBufferError is the bounded-cleanup result for a destination that ran
+// out of space: the call returns zero bytes and reports the guaranteed-
+// sufficient length, so the caller can retry with a correctly sized buffer
+// instead of trusting partial output.
+func shortBufferError(dstLen, need int) error {
+	return &lz4errors.ShortBufferError{Have: dstLen, Need: need}
+}
+
+// checkCompressArgs rejects calls that could corrupt memory or produce a
+// half block before any byte is written: an alias between the destination
+// and either the source or the dictionary. Empty destinations or sources do
+// not alias, since they occupy no bytes.
+func checkCompressArgs(src, dst, dict []byte) error {
+	if aliases(src, dst) || aliases(dict, dst) {
+		return lz4errors.ErrOverlappingBuffers
+	}
+	return nil
+}
+
 func blockHash(x uint64) uint32 {
 	const prime6bytes = 227718039650203
 	return uint32(((x << (64 - 48)) * prime6bytes) >> (64 - hashLog))
@@ -46,10 +67,17 @@ func UncompressBlock(src, dst, dict []byte) (int, error) {
 	if len(src) == 0 {
 		return 0, nil
 	}
+	// The decoder reads src and dict while writing dst; shared memory would
+	// let a write change bytes still to be decoded. Check before touching any.
+	if aliases(src, dst) || aliases(dict, dst) {
+		return 0, lz4errors.ErrOverlappingBuffers
+	}
 	if di := decodeBlock(dst, src, dict); di >= 0 {
 		return di, nil
 	}
-	return 0, lz4errors.ErrInvalidSourceShortBuffer
+	// The required size is encoded nowhere in a block, so Need stays 0; the
+	// caller must supply a buffer sized to the original block length.
+	return 0, &lz4errors.ShortBufferError{Have: len(dst), Need: 0}
 }
 
 type Compressor struct {
@@ -108,11 +136,19 @@ func CompressBlock(src, dst []byte) (int, error) {
 }
 
 func (c *Compressor) CompressBlock(src, dst []byte) (int, error) {
-	// Zero out reused table to avoid non-deterministic output (issue #65).
+	if err := checkCompressArgs(src, dst, nil); err != nil {
+		return 0, err
+	}
+	// Zero out reused table to avoid non-deterministic output (issue #65), and
+	// drop any dictionary from a previous CompressBlockWithDict call so a
+	// reused compressor never keeps the caller's data alive or matches into it.
 	c.reset()
+	c.dict = nil
 
 	// Return 0, nil only if the destination buffer size is < CompressBlockBound.
 	isNotCompressible := len(dst) < CompressBlockBound(len(src))
+	// The guaranteed-sufficient size, reported if the output runs past dst.
+	bound := CompressBlockBound(len(src))
 
 	// adaptSkipLog sets how quickly the compressor begins skipping blocks when data is incompressible.
 	// This significantly speeds up incompressible data and usually has very small impact on compression.
@@ -204,7 +240,7 @@ func (c *Compressor) CompressBlock(src, dst []byte) (int, error) {
 
 		mLen = si - mLen
 		if di >= len(dst) {
-			return 0, lz4errors.ErrInvalidSourceShortBuffer
+			return 0, shortBufferError(len(dst), bound)
 		}
 		// Token: literal length in the high nibble, match length in the low.
 		tok := byte(0xF)
@@ -224,7 +260,7 @@ func (c *Compressor) CompressBlock(src, dst []byte) (int, error) {
 				di++
 			}
 			if di >= len(dst) {
-				return 0, lz4errors.ErrInvalidSourceShortBuffer
+				return 0, shortBufferError(len(dst), bound)
 			}
 			dst[di] = byte(l)
 		}
@@ -232,7 +268,7 @@ func (c *Compressor) CompressBlock(src, dst []byte) (int, error) {
 
 		// Literals.
 		if di+lLen > len(dst) {
-			return 0, lz4errors.ErrInvalidSourceShortBuffer
+			return 0, shortBufferError(len(dst), bound)
 		}
 		copy(dst[di:di+lLen], src[anchor:anchor+lLen])
 		di += lLen + 2
@@ -240,7 +276,7 @@ func (c *Compressor) CompressBlock(src, dst []byte) (int, error) {
 
 		// Encode offset.
 		if di > len(dst) {
-			return 0, lz4errors.ErrInvalidSourceShortBuffer
+			return 0, shortBufferError(len(dst), bound)
 		}
 		dst[di-2], dst[di-1] = byte(offset), byte(offset>>8)
 
@@ -251,7 +287,7 @@ func (c *Compressor) CompressBlock(src, dst []byte) (int, error) {
 				di++
 			}
 			if di >= len(dst) {
-				return 0, lz4errors.ErrInvalidSourceShortBuffer
+				return 0, shortBufferError(len(dst), bound)
 			}
 			dst[di] = byte(mLen)
 			di++
@@ -273,7 +309,7 @@ lastLiterals:
 
 	// Last literals.
 	if di >= len(dst) {
-		return 0, lz4errors.ErrInvalidSourceShortBuffer
+		return 0, shortBufferError(len(dst), bound)
 	}
 	lLen := len(src) - anchor
 	if lLen < 0xF {
@@ -286,7 +322,7 @@ lastLiterals:
 			di++
 		}
 		if di >= len(dst) {
-			return 0, lz4errors.ErrInvalidSourceShortBuffer
+			return 0, shortBufferError(len(dst), bound)
 		}
 		dst[di] = byte(lLen)
 	}
@@ -298,7 +334,7 @@ lastLiterals:
 		return 0, nil
 	}
 	if di+len(src)-anchor > len(dst) {
-		return 0, lz4errors.ErrInvalidSourceShortBuffer
+		return 0, shortBufferError(len(dst), bound)
 	}
 	di += copy(dst[di:di+len(src)-anchor], src[anchor:])
 	return di, nil
@@ -464,6 +500,9 @@ func CompressBlockHC(src, dst []byte, depth CompressionLevel) (int, error) {
 }
 
 func (c *CompressorHC) CompressBlock(src, dst []byte, depth CompressionLevel) (int, error) {
+	if err := checkCompressArgs(src, dst, nil); err != nil {
+		return 0, err
+	}
 	// Zero out reused tables to avoid non-deterministic output (issue #65).
 	if len(src) <= winSize {
 		if c.smallDirty {
@@ -473,7 +512,8 @@ func (c *CompressorHC) CompressBlock(src, dst []byte, depth CompressionLevel) (i
 		return compressBlockHC(&c.small, src, dst, depth)
 	}
 	if int64(len(src)) > math.MaxInt32 {
-		// Positions are stored as int32.
+		// Positions are stored as int32, so a guaranteed output size cannot
+		// be computed; this is an input limit rather than a short destination.
 		return 0, lz4errors.ErrInvalidSourceShortBuffer
 	}
 	if c.large == nil {
@@ -486,13 +526,14 @@ func (c *CompressorHC) CompressBlock(src, dst []byte, depth CompressionLevel) (i
 }
 
 func compressBlockHC[T hcPosition](t *hcTables[T], src, dst []byte, depth CompressionLevel) (_ int, err error) {
-	defer recoverBlock(&err)
+	bound := CompressBlockBound(len(src))
+	defer recoverBounds(&err, len(dst), bound)
 	// Short destinations are caught by bounds checks, recovered above. Cap dst
 	// so that copies into it cannot reslice past len into the caller's memory.
 	dst = dst[:len(dst):len(dst)]
 
 	// Return 0, nil only if the destination buffer size is < CompressBlockBound.
-	isNotCompressible := len(dst) < CompressBlockBound(len(src))
+	isNotCompressible := len(dst) < bound
 
 	// adaptSkipLog sets how quickly the compressor begins skipping blocks when data is incompressible.
 	// This significantly speeds up incompressible data and usually has very small impact on compression.

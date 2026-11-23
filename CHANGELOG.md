@@ -21,6 +21,14 @@ issues in this repository.
   only the `Fast` level and non-legacy frames, uses the last 64 KiB of the
   dictionary, and turns off concurrency. Frames do not record a dictionary ID,
   so the reader needs the same dictionary (#286).
+- Block APIs reject overlapping source and destination (or dictionary and
+  destination) slices with `ErrOverlappingBuffers` before writing anything;
+  the `nounsafe`/`purego` builds, which cannot compare backing arrays, keep
+  the previous behavior. A destination too small for compression now returns
+  a `ShortBufferError` carrying the length that is guaranteed to suffice
+  (`CompressBlockBound` of the input); it matches
+  `ErrInvalidSourceShortBuffer` through `errors.Is`, and the failed call
+  writes nothing usable.
 
 ### Fixed
 

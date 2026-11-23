@@ -3,6 +3,7 @@ package lz4block_test
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -124,9 +125,21 @@ func TestCompressCornerCase_CopyDstUpperBound(t *testing.T) {
 		// We provide a destination that is too small to trigger an out-of-bounds,
 		// which makes it return the error we want.
 		zbuf := make([]byte, int(float64(len(src))*0.40))
-		_, err := compress(src, zbuf)
-		if err != lz4.ErrInvalidSourceShortBuffer {
+		n, err := compress(src, zbuf)
+		if !errors.Is(err, lz4.ErrInvalidSourceShortBuffer) {
 			t.Fatal("err should be ErrInvalidSourceShortBuffer, was", err)
+		}
+		if n != 0 {
+			t.Fatalf("a failed call must return zero bytes, got %d", n)
+		}
+		// The structured error tells the caller how big a buffer is guaranteed
+		// to work and how much room it had.
+		var short *lz4errors.ShortBufferError
+		if !errors.As(err, &short) {
+			t.Fatalf("expected *ShortBufferError, got %T", err)
+		}
+		if want := lz4block.CompressBlockBound(len(src)); short.Need != want || short.Have != len(zbuf) {
+			t.Fatalf("ShortBufferError = {Have:%d Need:%d}, want {Have:%d Need:%d}", short.Have, short.Need, len(zbuf), want)
 		}
 	}
 
@@ -177,7 +190,7 @@ func TestIssue116(t *testing.T) {
 
 	var c lz4block.Compressor
 	_, err = c.CompressBlock(src, dst)
-	if err != lz4errors.ErrInvalidSourceShortBuffer {
+	if !errors.Is(err, lz4errors.ErrInvalidSourceShortBuffer) {
 		t.Fatalf("expected %v, got nil", lz4errors.ErrInvalidSourceShortBuffer)
 	}
 }

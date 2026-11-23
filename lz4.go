@@ -34,7 +34,10 @@ func CompressBlockBound(n int) int {
 //
 // The destination buffer must be sized appropriately.
 //
-// An error is returned if the source data is invalid or the destination buffer is too small.
+// An error is returned if the source data is invalid, the destination buffer
+// is too small, or the source and destination buffers overlap. A short
+// destination yields a *ShortBufferError (which also matches
+// ErrInvalidSourceShortBuffer through errors.Is); nothing usable is written.
 func UncompressBlock(src, dst []byte) (int, error) {
 	return lz4block.UncompressBlock(src, dst, nil)
 }
@@ -44,7 +47,10 @@ func UncompressBlock(src, dst []byte) (int, error) {
 //
 // The destination buffer must be sized appropriately.
 //
-// An error is returned if the source data is invalid or the destination buffer is too small.
+// An error is returned if the source data is invalid, the destination buffer
+// is too small, or the source, dictionary and destination buffers overlap. A
+// short destination yields a *ShortBufferError (which also matches
+// ErrInvalidSourceShortBuffer through errors.Is); nothing usable is written.
 func UncompressBlockWithDict(src, dst, dict []byte) (int, error) {
 	return lz4block.UncompressBlock(src, dst, dict)
 }
@@ -68,6 +74,11 @@ type Compressor struct{ c lz4block.Compressor }
 // larger buffer that is still smaller than CompressBlockBound(len(src)). The
 // return value (0, nil) means the data is likely incompressible and a buffer
 // of length CompressBlockBound(len(src)) should be passed in.
+//
+// A dst too short for the compressed data returns a *ShortBufferError whose
+// Need field is the guaranteed-sufficient size; the call writes nothing
+// usable, so retrying with a buffer of that length is safe. Overlapping src
+// and dst are rejected with ErrOverlappingBuffers before any write.
 func (c *Compressor) CompressBlock(src, dst []byte) (int, error) {
 	return c.c.CompressBlock(src, dst)
 }
@@ -220,4 +231,19 @@ const (
 	// from the content size in its descriptor, or when writing a frame whose data differs
 	// from SizeOption.
 	ErrInvalidContentSize = lz4errors.ErrInvalidContentSize
+	// ErrOverlappingBuffers is returned when a block call's source and
+	// destination (or dictionary and destination) byte slices share memory.
+	// The call rejects them before writing anything.
+	ErrOverlappingBuffers = lz4errors.ErrOverlappingBuffers
 )
+
+// ShortBufferError reports that a block operation's destination buffer was
+// too small. Need is the length guaranteed to be sufficient for compression
+// (CompressBlockBound of the input); it is 0 for decompression, where the
+// required size is not encoded in the block. Have is the length that was
+// supplied. The failed operation writes nothing usable and returns a zero
+// size.
+//
+// A ShortBufferError matches ErrInvalidSourceShortBuffer via errors.Is, so
+// existing code handling that sentinel keeps working.
+type ShortBufferError = lz4errors.ShortBufferError
