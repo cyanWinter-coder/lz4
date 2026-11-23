@@ -220,4 +220,9 @@ const (
 	// from the content size in its descriptor, or when writing a frame whose data differs
 	// from SizeOption.
 	ErrInvalidContentSize = lz4errors.ErrInvalidContentSize
+	// ErrOutputLimitExceeded is returned by a BlockReader when a block
+	// decompresses past the budget declared with BlockOutputLimitOption. The
+	// in-budget prefix is delivered first; the error then becomes sticky
+	// until Reset.
+	ErrOutputLimitExceeded = lz4errors.ErrOutputLimitExceeded
 )

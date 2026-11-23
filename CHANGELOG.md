@@ -15,6 +15,15 @@ issues in this repository.
 
 ### Added
 
+- `BlockReader` decompresses a single raw LZ4 block from an `io.Reader` with an
+  explicit output budget (`BlockOutputLimitOption`) and sticky terminal errors.
+  A block past the budget first delivers the in-budget prefix and then fails
+  with `ErrOutputLimitExceeded`; malformed input (`ErrInvalidSourceShortBuffer`)
+  always takes priority and delivers nothing, even when the bad byte follows the
+  budget. `Reset` clears the error, dictionary history and budget, and `Close`
+  releases the input and output references. `BlockDictionaryOption` supplies a
+  preset dictionary. The frame `Reader`, `Writer` and the existing block
+  functions are unchanged.
 - `DictionaryOption` sets a preset dictionary for `Writer`, `CompressingReader`
   and `Reader`, and `CompressBlockWithDict`, as a function and a `Compressor`
   method, compresses a block with one. Compressing with a dictionary supports

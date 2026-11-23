@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/pierrec/lz4/v4/internal/lz4errors"
 )
 
 // The fuzzers for blocks. The assembly decoders overrun on purpose when there
@@ -167,6 +169,72 @@ func FuzzDecodeBlockDifferential(f *testing.F) {
 		}
 		if gn >= 0 && (gn != wn || !bytes.Equal(got, want)) {
 			t.Fatalf("output mismatch: decodeBlock=%d decodeBlockGo=%d", gn, wn)
+		}
+
+		// The bounded decoder shares the reference's accept/reject decision.
+		// decodeBlockGo returns one negative sentinel for both a malformed
+		// block and an out-of-capacity destination; bounded splits them into
+		// retInvalid and retLimit. To classify the reference's failure, run
+		// it once with a destination large enough to hold any block this
+		// fuzzer builds. An empty input is the one case the public API treats
+		// as a valid empty block even though decodeBlockGo rejects it.
+		full := make([]byte, 1<<20)
+		fullN := decodeBlockGo(full, src, dict)
+		// The public API treats an empty input as a valid empty block.
+		if len(src) == 0 {
+			fullN = 0
+		}
+		blockMalformed := fullN < 0
+
+		bdst := make([]byte, int(dstLen)+64)
+		for i := range bdst {
+			bdst[i] = guardByte
+		}
+		bn, berr := UncompressBlockBounded(src, bdst[:dstLen], dict)
+		switch {
+		case blockMalformed:
+			// Format errors always win over the budget and deliver nothing.
+			if berr != lz4errors.ErrInvalidSourceShortBuffer || bn != 0 {
+				t.Fatalf("malformed block: bounded=(%d,%v), want format error with 0 bytes", bn, berr)
+			}
+		case fullN <= int(dstLen):
+			// The block fits: bounded must decode it exactly.
+			if berr != nil || bn != fullN || !bytes.Equal(bdst[:fullN], full[:fullN]) {
+				t.Fatalf("fitting block: bounded=(%d,%v), want %d bytes", bn, berr, fullN)
+			}
+		default:
+			// A well-formed block that does not fit: limit error with the
+			// exact in-budget prefix.
+			if berr != lz4errors.ErrOutputLimitExceeded || bn != int(dstLen) ||
+				!bytes.Equal(bdst[:dstLen], full[:dstLen]) {
+				t.Fatalf("over-budget block: bounded=(%d,%v), want prefix of %d", bn, berr, fullN)
+			}
+		}
+		for i := int(dstLen); i < len(bdst); i++ {
+			if bdst[i] != guardByte {
+				t.Fatalf("bounded wrote past the destination at byte %d", i)
+			}
+		}
+
+		// Every smaller budget on a valid block must return its exact prefix
+		// with the limit error, never a format error.
+		if !blockMalformed {
+			for _, limit := range []int{1, fullN / 2, max(fullN-1, 1)} {
+				if limit >= fullN {
+					continue
+				}
+				ldst := make([]byte, limit)
+				ln, lerr := UncompressBlockBounded(src, ldst, dict)
+				if lerr != lz4errors.ErrOutputLimitExceeded || ln != limit || !bytes.Equal(ldst, full[:limit]) {
+					t.Fatalf("limit=%d: got (%d,%v), want prefix of %d with limit error", limit, ln, lerr, fullN)
+				}
+			}
+			// A destination large enough must decode the block in full.
+			odst := make([]byte, fullN)
+			on, oerr := UncompressBlockBounded(src, odst, dict)
+			if oerr != nil || on != fullN || !bytes.Equal(odst, full[:fullN]) {
+				t.Fatalf("full-size dst: got (%d,%v), want %d", on, oerr, fullN)
+			}
 		}
 	})
 }
