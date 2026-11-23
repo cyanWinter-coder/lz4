@@ -3,6 +3,7 @@ package lz4_test
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"hash/fnv"
 	"io"
 	"math/rand"
@@ -171,6 +172,128 @@ func FuzzFrameRoundTrip(f *testing.F) {
 		}
 		if r := reports.Load(); r != n {
 			t.Fatalf("OnBlockDone reported %d blocks after Close; the frame has %d", r-n, n)
+		}
+	})
+}
+
+// FuzzFrameDictionary checks that a frame made with a dictionary records the
+// dictionary's identity, that it decodes with the same effective dictionary
+// and fails before any output with a missing or different one, and that
+// nothing the caller does to its dictionary slice afterwards matters.
+func FuzzFrameDictionary(f *testing.F) {
+	dict := bytes.Repeat([]byte("0123456789abcdefghij"), 400) // > 64 KiB
+	f.Add([]byte("dictionary payload"), dict, uint64(1), uint16(0), uint8(0))
+	f.Add([]byte(nil), dict, uint64(0), uint16(0), uint8(0))
+	f.Add(testData(200, true, 1), []byte("small dict"), uint64(0), uint16(700), uint8(1))
+	f.Add(testData(300, false, 2), dict[len(dict)-1000:], uint64(300), uint16(0), uint8(2))
+	f.Fuzz(func(t *testing.T, data, dict []byte, size uint64, chunk uint16, mode uint8) {
+		// Keep the fuzzer's inputs bounded: a dictionary larger than the
+		// window only exercises the tail, and huge frames are slow.
+		if len(data) > 1<<20 {
+			data = data[:1<<20]
+		}
+		if len(dict) > 2*lz4.MaxDictSize {
+			dict = dict[:2*lz4.MaxDictSize]
+		}
+		// Copy the dictionary so that mutating the caller's slice below cannot
+		// affect what the test expects the effective dictionary to be, or the
+		// dictionary used for decoding: only the encoder's own copy matters.
+		effective := append([]byte{}, dict...)
+		if len(effective) > lz4.MaxDictSize {
+			effective = effective[len(effective)-lz4.MaxDictSize:]
+		}
+		decodeDict := append([]byte{}, effective...)
+		callerDict := append([]byte{}, dict...) // what the caller hands to the option
+
+		opts := []lz4.Option{lz4.DictionaryOption(callerDict)}
+		if size > 0 && size == uint64(len(data)) {
+			opts = append(opts, lz4.SizeOption(size))
+		}
+		var frame bytes.Buffer
+		zw := lz4.NewWriter(&frame)
+		if err := zw.Apply(opts...); err != nil {
+			t.Fatal(err)
+		}
+		step := int(chunk)
+		if step <= 0 {
+			step = len(data)
+		}
+		for rest := data; len(rest) > 0; {
+			n := min(step, len(rest))
+			if _, err := zw.Write(rest[:n]); err != nil {
+				t.Fatal(err)
+			}
+			rest = rest[n:]
+		}
+		// Mutate the caller's dictionary after compressing: decoding must
+		// still use the copy the Writer took, not these bytes.
+		for i := range callerDict {
+			callerDict[i] ^= 0xFF
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		_, _, id, has := dictFrameInfo(t, frame.Bytes())
+		wantID := lz4.DictID(effective)
+		if (wantID != 0) != has || (has && id != wantID) {
+			t.Fatalf("recorded ID %#x (has=%v), want %#x", id, has, wantID)
+		}
+		if wantID == 0 && has {
+			t.Fatal("recorded a dictionary ID for an empty dictionary")
+		}
+		if has && id == 0 {
+			t.Fatal("recorded ID 0, which means no dictionary")
+		}
+
+		// The same effective dictionary decodes it; the Writer's copy was
+		// used, so the mutated dict bytes above are irrelevant.
+		zr := lz4.NewReader(bytes.NewReader(frame.Bytes()))
+		if err := zr.Apply(lz4.DictionaryOption(decodeDict)); err != nil {
+			t.Fatal(err)
+		}
+		out, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatalf("decode with the same dictionary: %v", err)
+		}
+		if !bytes.Equal(out, data) {
+			d := 0
+			for d < len(out) && d < len(data) && out[d] == data[d] {
+				d++
+			}
+			t.Fatalf("round trip mismatch at byte %d: %d vs %d bytes, chunk=%d size=%d mode=%d id=%#x",
+				d, len(out), len(data), chunk, size, mode, id)
+		}
+
+		// Without a dictionary, a frame that records one must fail before
+		// producing any output; with an unrelated dictionary it must fail
+		// too. mode 0 checks both.
+		if has && mode%2 == 0 {
+			zr := lz4.NewReader(bytes.NewReader(frame.Bytes()))
+			var got bytes.Buffer
+			_, err := io.Copy(&got, zr)
+			if !errors.Is(err, lz4.ErrDictionaryRequired) || got.Len() != 0 {
+				t.Fatalf("missing dictionary: err=%v, %d bytes decoded", err, got.Len())
+			}
+			wrong := append([]byte("wrong"), effective...)
+			wrong[len(wrong)-1] ^= 0xFF
+			if len(wrong) > lz4.MaxDictSize {
+				wrong = wrong[len(wrong)-lz4.MaxDictSize:]
+			}
+			// If the mutation happened to collide with the real identity
+			// (possible in principle for any 32-bit checksum), there is
+			// nothing to reject.
+			if lz4.DictID(wrong) != wantID {
+				zr = lz4.NewReader(bytes.NewReader(frame.Bytes()))
+				if err := zr.Apply(lz4.DictionaryOption(wrong)); err != nil {
+					t.Fatal(err)
+				}
+				got.Reset()
+				_, err = io.Copy(&got, zr)
+				if !errors.Is(err, lz4.ErrDictionaryMismatch) || got.Len() != 0 {
+					t.Fatalf("wrong dictionary: err=%v, %d bytes decoded", err, got.Len())
+				}
+			}
 		}
 	})
 }

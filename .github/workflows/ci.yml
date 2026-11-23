@@ -100,6 +100,7 @@ jobs:
           go test -run '^$' -fuzz '^FuzzCompressorCCompat$' -fuzztime 20s ./internal/lz4block
           go test -run '^$' -fuzz '^FuzzReader$' -fuzztime 20s .
           go test -run '^$' -fuzz '^FuzzFrameRoundTrip$' -fuzztime 20s .
+          go test -run '^$' -fuzz '^FuzzFrameDictionary$' -fuzztime 20s .
       - name: upload failing inputs
         if: failure()
         uses: actions/upload-artifact@v4

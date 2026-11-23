@@ -8,7 +8,8 @@ native Go fuzzers, which these corpora seed:
 - `internal/lz4block/fuzz_test.go`: blocks (`FuzzBlockRoundTrip`,
   `FuzzDecodeBlockDifferential`, `FuzzCompressBlockDst`,
   `FuzzCompressorCCompat`);
-- `fuzz_test.go`: frames (`FuzzReader`, `FuzzFrameRoundTrip`);
+- `fuzz_test.go`: frames (`FuzzReader`, `FuzzFrameRoundTrip`,
+  `FuzzFrameDictionary`);
 - `bench/ccompat_test.go`: `FuzzCCompatMatchesC`, which checks that
   `CompressorCCompat` produces the same bytes as the C library's
   `LZ4_compress_fast`. It is in the separate `bench` module because it needs

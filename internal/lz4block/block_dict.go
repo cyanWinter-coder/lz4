@@ -8,11 +8,11 @@ type dictData struct {
 	inUse [htSize / 32]uint32
 }
 
-// initDict sets the dictionary, keeping only its last winSize bytes, and
+// initDict sets the dictionary, keeping only its last MaxDictSize bytes, and
 // indexes it unless it is the dictionary already indexed.
 func (c *Compressor) initDict(dict []byte) {
-	if len(dict) > winSize {
-		dict = dict[len(dict)-winSize:]
+	if len(dict) > MaxDictSize {
+		dict = dict[len(dict)-MaxDictSize:]
 	}
 	if len(dict) == 0 {
 		c.dict = nil

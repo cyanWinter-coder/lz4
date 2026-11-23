@@ -102,4 +102,21 @@ func TestCompressingReader_Dictionary(t *testing.T) {
 	if err := cr2.Apply(lz4.CompressionLevelOption(lz4.Level1), lz4.DictionaryOption(dict)); !errors.Is(err, lz4.ErrOptionNotApplicable) {
 		t.Fatalf("expected ErrOptionNotApplicable, got %v", err)
 	}
+
+	// The frame it writes records the dictionary identity, so a Reader with a
+	// different dictionary fails before decoding anything.
+	flg, _, id, has := dictFrameInfo(t, compressed)
+	if !has || id != lz4.DictID(dict) {
+		t.Fatalf("CompressingReader frame records ID %#x (has=%v), want %#x", id, has, lz4.DictID(dict))
+	}
+	if flg&0x01 == 0 {
+		t.Fatalf("DictID flag not set in FLG %#02x", flg)
+	}
+	wrong := lz4.NewReader(bytes.NewReader(compressed))
+	if err := wrong.Apply(lz4.DictionaryOption([]byte("not the right dictionary"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(wrong); !errors.Is(err, lz4.ErrDictionaryMismatch) {
+		t.Fatalf("wrong dictionary: got %v, want ErrDictionaryMismatch", err)
+	}
 }

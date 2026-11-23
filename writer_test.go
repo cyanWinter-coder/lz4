@@ -18,6 +18,7 @@ import (
 
 	"github.com/pierrec/lz4/v4"
 	"github.com/pierrec/lz4/v4/internal/lz4block"
+	"github.com/pierrec/lz4/v4/internal/xxh32"
 )
 
 func TestWriter(t *testing.T) {
@@ -574,6 +575,55 @@ func TestWriterCommand(t *testing.T) {
 	}
 }
 
+// TestWriterCommandDictionary checks that the lz4 command, given the same
+// dictionary with -D, decodes a frame the Writer made with a dictionary. The
+// frame records a dictionary ID, which the C implementation reads but does not
+// require: it must not reject or misread it. CI runs it in the silesia job,
+// which installs lz4.
+func TestWriterCommandDictionary(t *testing.T) {
+	lz4cmd, err := exec.LookPath("lz4")
+	if err != nil {
+		t.Skip("no lz4 binary to test against")
+	}
+	dir := t.TempDir()
+	dictPath := dir + "/dict.bin"
+	dict := testData(48<<10, true, 11) // under 64 KiB, so the whole dict is used
+	if err := os.WriteFile(dictPath, dict, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Input that shares plenty of text with the dictionary.
+	data := testData(300<<10, true, 12)
+	for _, opts := range [][]lz4.Option{
+		{lz4.DictionaryOption(dict)},
+		{lz4.DictionaryOption(dict), lz4.BlockSizeOption(lz4.Block64Kb)},
+		{lz4.DictionaryOption(dict), lz4.SizeOption(uint64(len(data)))},
+	} {
+		out := new(bytes.Buffer)
+		zw := lz4.NewWriter(out)
+		if err := zw.Apply(opts...); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := zw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.Command(lz4cmd, "-d", "-c", "-D", dictPath)
+		cmd.Stdin = out
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		got, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%v: %s", err, stderr.Bytes())
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("lz4 output mismatch with dictionary: got %d bytes; want %d: %s", len(got), len(data), stderr.Bytes())
+		}
+	}
+}
+
 func TestWriterConcurrency(t *testing.T) {
 	const someGiantFile = "testdata/vmlinux_LZ4_19377.gz"
 
@@ -1106,6 +1156,469 @@ func TestWriter_DictionaryOptionsValidation(t *testing.T) {
 	}
 	if !bytes.Equal(decompressed, src) {
 		t.Fatalf("decoded output mismatch after mutating caller dictionary")
+	}
+}
+
+// dictFrameInfo splits the frame descriptor of a non-legacy frame and returns
+// its FLG and BD bytes plus the optional dictionary ID (0 if absent). It
+// checks the header checksum, so a descriptor that does not parse is caught
+// rather than silently read.
+func dictFrameInfo(t *testing.T, frame []byte) (flg, bd byte, dictID uint32, hasDictID bool) {
+	t.Helper()
+	if len(frame) < 7 || binary.LittleEndian.Uint32(frame) != 0x184D2204 {
+		t.Fatalf("not a frame: % x", frame[:min(len(frame), 8)])
+	}
+	flg, bd = frame[4], frame[5]
+	p := 6
+	if flg&0x08 != 0 {
+		p += 8 // content size
+	}
+	if flg&0x01 != 0 {
+		dictID = binary.LittleEndian.Uint32(frame[p:])
+		hasDictID = true
+		p += 4
+	}
+	if p >= len(frame) {
+		t.Fatalf("frame of %d bytes has no header checksum", len(frame))
+	}
+	if got, want := frame[p], byte(xxh32.ChecksumZero(frame[4:p])>>8); got != want {
+		t.Fatalf("header checksum %#02x, want %#02x", got, want)
+	}
+	return flg, bd, dictID, hasDictID
+}
+
+// A Writer records the identity of the dictionary it compresses with, and no
+// identity when it has none. The identity covers only the last 64 KiB.
+func TestWriter_DictionaryIDRecorded(t *testing.T) {
+	dict := []byte("schema:id,name,email,timestamp,event,status,metadata,payload")
+	src := bytes.Repeat([]byte("schema:id=1,name=Alice,status=ok\n"), 100)
+
+	// Long dictionary: only its tail is used, so its ID must equal the tail's.
+	tail := bytes.Repeat([]byte("tail-of-the-dictionary-"), 4000) // 96 KiB > 64 KiB
+	longDict := append([]byte("ignored prefix"), tail...)
+
+	for _, tc := range []struct {
+		name     string
+		opts     []lz4.Option
+		wantID   uint32
+		wantFlag bool
+	}{
+		{"without", nil, 0, false},
+		{"dict", []lz4.Option{lz4.DictionaryOption(dict)}, lz4.DictID(dict), true},
+		{"longDict", []lz4.Option{lz4.DictionaryOption(longDict)}, lz4.DictID(tail), true},
+		{"emptyDict", []lz4.Option{lz4.DictionaryOption(nil)}, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := encode(t, src, tc.opts...)
+			flg, _, id, has := dictFrameInfo(t, frame)
+			if has != tc.wantFlag || (has && flg&0x01 == 0) {
+				t.Fatalf("dict ID flag = %v (FLG %#02x), want %v", has, flg, tc.wantFlag)
+			}
+			if has && id != tc.wantID {
+				t.Fatalf("recorded dict ID %#x, want %#x", id, tc.wantID)
+			}
+			if tc.wantFlag && tc.wantID == 0 {
+				t.Fatal("recorded a dictionary with ID 0, which means none")
+			}
+			// The frame still decodes with the same dictionary, and the Reader
+			// sees the identity.
+			zr := lz4.NewReader(bytes.NewReader(frame))
+			if err := zr.Apply(tc.opts...); err != nil {
+				t.Fatal(err)
+			}
+			out, err := io.ReadAll(zr)
+			if err != nil || !bytes.Equal(out, src) {
+				t.Fatalf("round trip: %d bytes, err %v", len(out), err)
+			}
+			if got := zr.DictID(); got != tc.wantID {
+				t.Fatalf("Reader.DictID() = %#x, want %#x", got, tc.wantID)
+			}
+		})
+	}
+}
+
+// Applying an empty dictionary clears a previously set one, and the frame no
+// longer records an identity. Reset keeps the options, so a Writer reused
+// without re-applying keeps its dictionary.
+func TestWriter_DictionaryCleared(t *testing.T) {
+	dict := []byte("a dictionary")
+	src := []byte("payload that mentions a dictionary")
+
+	// A Writer that had a dictionary and is reused after Reset keeps it,
+	// since Reset preserves options.
+	var kept bytes.Buffer
+	zw := lz4.NewWriter(&kept)
+	if err := zw.Apply(lz4.DictionaryOption(dict)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := zw.Write(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zw.Reset(io.Discard)
+	if _, err := zw.Write(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, id, has := dictFrameInfo(t, kept.Bytes()); !has || id != lz4.DictID(dict) {
+		t.Fatalf("reset Writer lost its dictionary: has=%v id=%#x", has, id)
+	}
+
+	// An empty dictionary on a fresh Writer records nothing.
+	var cleared bytes.Buffer
+	zw2 := lz4.NewWriter(&cleared)
+	if err := zw2.Apply(lz4.DictionaryOption(dict), lz4.DictionaryOption(nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := zw2.Write(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	flg, _, _, has := dictFrameInfo(t, cleared.Bytes())
+	if has || flg&0x01 != 0 {
+		t.Fatalf("cleared dictionary still recorded: FLG %#02x, has=%v", flg, has)
+	}
+	if out, err := io.ReadAll(lz4.NewReader(bytes.NewReader(cleared.Bytes()))); err != nil || !bytes.Equal(out, src) {
+		t.Fatalf("cleared frame: %q, %v", out, err)
+	}
+}
+
+// Reader.DictID is 0 before the header is read and after Reset, reports the
+// current frame's identity once the header is parsed, and keeps it after the
+// frame's last byte.
+func TestReader_DictIDLifecycle(t *testing.T) {
+	dict := []byte("the dictionary")
+	src := []byte("payload")
+	frame := encode(t, src, lz4.DictionaryOption(dict))
+	want := lz4.DictID(dict)
+
+	zr := lz4.NewReader(bytes.NewReader(frame))
+	if err := zr.Apply(lz4.DictionaryOption(dict)); err != nil {
+		t.Fatal(err)
+	}
+	if got := zr.DictID(); got != 0 {
+		t.Fatalf("before read: DictID = %#x, want 0", got)
+	}
+	// A Read of at least the frame's size parses the header and consumes it.
+	out, err := io.ReadAll(zr)
+	if err != nil || !bytes.Equal(out, src) {
+		t.Fatalf("read: %q, %v", out, err)
+	}
+	if got := zr.DictID(); got != want {
+		t.Fatalf("after read: DictID = %#x, want %#x", got, want)
+	}
+	zr.Reset(bytes.NewReader(frame))
+	if got := zr.DictID(); got != 0 {
+		t.Fatalf("after Reset: DictID = %#x, want 0", got)
+	}
+}
+
+// A frame that records a dictionary fails before any payload is decoded when
+// the Reader has no dictionary or a different one, and the error is sticky.
+func TestReader_DictionaryIdentityMismatch(t *testing.T) {
+	dict := []byte("the dictionary used to make the frame")
+	other := []byte("a different dictionary that is not it")
+	src := bytes.Repeat([]byte("payload that shares words with the dictionary\n"), 200)
+	frame := encode(t, src, lz4.DictionaryOption(dict))
+
+	for _, tc := range []struct {
+		name string
+		opts []lz4.Option
+		want error
+	}{
+		{"missing", nil, lz4.ErrDictionaryRequired},
+		{"different", []lz4.Option{lz4.DictionaryOption(other)}, lz4.ErrDictionaryMismatch},
+		{"prefixOnly", []lz4.Option{lz4.DictionaryOption(dict[:len(dict)/2])}, lz4.ErrDictionaryMismatch},
+		{"longerTailDiffers", []lz4.Option{lz4.DictionaryOption(append([]byte("x"), dict...))}, lz4.ErrDictionaryMismatch},
+	} {
+		for _, mode := range decodeModes {
+			t.Run(tc.name+"/"+mode.name, func(t *testing.T) {
+				zr := lz4.NewReader(bytes.NewReader(frame))
+				if err := zr.Apply(append([]lz4.Option{lz4.ConcurrencyOption(mode.conc)}, tc.opts...)...); err != nil {
+					t.Fatal(err)
+				}
+				var out bytes.Buffer
+				var err error
+				if mode.bufSize == 0 {
+					_, err = zr.WriteTo(&out)
+				} else {
+					_, err = io.Copy(&out, zr)
+				}
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("got %v, want %v", err, tc.want)
+				}
+				if out.Len() != 0 {
+					t.Fatalf("decoded %d bytes before failing", out.Len())
+				}
+			})
+		}
+	}
+
+	// With the right dictionary, the same frame decodes.
+	zr := lz4.NewReader(bytes.NewReader(frame))
+	if err := zr.Apply(lz4.DictionaryOption(dict)); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(zr)
+	if err != nil || !bytes.Equal(out, src) {
+		t.Fatalf("right dictionary: %d bytes, err %v", len(out), err)
+	}
+}
+
+// The format defines a dictionary ID of 0 as "no dictionary ID". A frame whose
+// descriptor sets the DictID flag but carries the value 0 must decode without a
+// dictionary, as one that omits the field does.
+func TestReader_DictionaryIDZero(t *testing.T) {
+	src := []byte("a frame with a zero-length recorded dictionary ID")
+	frame := encode(t, src)
+	// Add a DictID field of 0: set the flag and insert four zero bytes before
+	// the header checksum, then fix the checksum.
+	flg := frame[4]
+	p := 6
+	if flg&0x08 != 0 {
+		p += 8
+	}
+	desc := append([]byte{}, frame[4:p]...)
+	desc[0] |= 0x01
+	desc = append(desc, 0, 0, 0, 0)
+	desc = append(desc, 0) // checksum placeholder
+	desc[len(desc)-1] = byte(xxh32.ChecksumZero(desc[:len(desc)-1]) >> 8)
+	out := append([]byte{}, frame[:4]...)
+	out = append(out, desc...)
+	out = append(out, frame[p+1:]...) // skip the original checksum
+
+	for _, opts := range [][]lz4.Option{nil, {lz4.DictionaryOption([]byte("some dictionary"))}} {
+		zr := lz4.NewReader(bytes.NewReader(out))
+		if err := zr.Apply(opts...); err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(zr)
+		if err != nil || !bytes.Equal(got, src) {
+			t.Fatalf("%v: %q, %v", opts, got, err)
+		}
+	}
+}
+
+// Frames that record no dictionary ID, as made by implementations that do not
+// record one or by this package before it did, still decode with a supplied
+// dictionary and without one; the Reader just cannot verify them.
+func TestReader_DictionaryUnrecordedFrame(t *testing.T) {
+	dict := []byte("legacy dictionary bytes")
+	src := []byte("no dictionary identity is recorded here")
+	for _, tc := range []struct {
+		name        string
+		encodeOpts  []lz4.Option
+		decodeDicts [][]byte // dictionaries to decode with; nil means none
+	}{
+		// A frame with no dictionary decodes with or without one.
+		{"none", nil, [][]byte{nil, dict}},
+		// A frame made with a dictionary, but with its identity dropped,
+		// decodes only with that same dictionary.
+		{"unrecordedDictionary", []lz4.Option{lz4.DictionaryOption(dict)}, [][]byte{dict}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := dropDictID(t, encode(t, src, tc.encodeOpts...))
+			for _, d := range tc.decodeDicts {
+				var opts []lz4.Option
+				if d != nil {
+					opts = []lz4.Option{lz4.DictionaryOption(d)}
+				}
+				zr := lz4.NewReader(bytes.NewReader(frame))
+				if err := zr.Apply(opts...); err != nil {
+					t.Fatal(err)
+				}
+				out, err := io.ReadAll(zr)
+				if err != nil || !bytes.Equal(out, src) {
+					t.Fatalf("%d-byte dictionary: %d bytes, err %v", len(d), len(out), err)
+				}
+				if got := zr.DictID(); got != 0 {
+					t.Fatalf("Reader.DictID() = %#x, want 0", got)
+				}
+			}
+		})
+	}
+}
+
+// dropDictID rewrites a frame descriptor without its dictionary ID, fixing the
+// header checksum, as a writer that does not record identities would.
+func dropDictID(t *testing.T, frame []byte) []byte {
+	t.Helper()
+	if len(frame) < 7 || binary.LittleEndian.Uint32(frame) != 0x184D2204 {
+		t.Fatalf("not a frame")
+	}
+	flg := frame[4]
+	if flg&0x01 == 0 {
+		return frame
+	}
+	// Descriptor fields are FLG, BD, [content size], [dict id], HC.
+	idPos := 6
+	if flg&0x08 != 0 {
+		idPos += 8
+	}
+	hcPos := idPos + 4
+	var desc []byte
+	desc = append(desc, frame[4:idPos]...) // FLG, BD, content size
+	desc = append(desc, 0)                 // HC placeholder, filled below
+	desc[0] &^= 0x01                       // clear the DictID flag
+	desc[len(desc)-1] = byte(xxh32.ChecksumZero(desc[:len(desc)-1]) >> 8)
+	out := append([]byte{}, frame[:4]...)
+	out = append(out, desc...)
+	out = append(out, frame[hcPos+1:]...) // blocks onward
+	return out
+}
+
+// Each Writer, Reader and CompressingReader owns an independent copy of its
+// dictionary, so changing the slice a caller passed to DictionaryOption, or
+// resetting one object, does not affect an operation in progress.
+func TestDictionaryIndependentCopies(t *testing.T) {
+	dict := []byte("the original dictionary bytes shared by the objects")
+	src := bytes.Repeat([]byte("the original dictionary bytes appear in this payload too\n"), 500)
+
+	// One option value applied to several objects, as a caller might reuse it.
+	opt := lz4.DictionaryOption(dict)
+
+	var wbuf bytes.Buffer
+	zw := lz4.NewWriter(&wbuf)
+	if err := zw.Apply(opt); err != nil {
+		t.Fatal(err)
+	}
+	// Mutate the caller's slice after applying: the Writer must be unaffected.
+	for i := range dict {
+		dict[i] = 'X'
+	}
+
+	var rbuf bytes.Buffer
+	zwr := lz4.NewWriter(&rbuf)
+	if err := zwr.Apply(opt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start writing and interleave with reading frames made by both writers.
+	for _, w := range []*lz4.Writer{zw, zwr} {
+		if _, err := w.Write(src); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Reset one writer and write a second frame: it must use the same
+	// dictionary, unaffected by the other writer's state.
+	zw.Reset(io.Discard)
+	if _, err := zw.Write([]byte("second frame")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zwr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantID := lz4.DictID([]byte("the original dictionary bytes shared by the objects"))
+	for name, frame := range map[string][]byte{"zw": wbuf.Bytes(), "zwr": rbuf.Bytes()} {
+		_, _, id, has := dictFrameInfo(t, frame)
+		if !has || id != wantID {
+			t.Fatalf("%s: recorded ID %#x (has=%v), want %#x", name, id, has, wantID)
+		}
+	}
+
+	// A Reader built from the same option decodes a frame even though the
+	// original dictionary slice was mutated.
+	zr := lz4.NewReader(bytes.NewReader(rbuf.Bytes()))
+	if err := zr.Apply(opt); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(zr)
+	if err != nil || !bytes.Equal(out, src) {
+		t.Fatalf("decode after mutating caller dictionary: %d bytes, err %v", len(out), err)
+	}
+}
+
+// Dictionary identity must be honored the same way regardless of block size,
+// multiple frames and inputs larger than the dictionary window, and across
+// concurrency settings on the reader side.
+func TestDictionaryIdentityBoundaries(t *testing.T) {
+	// A dictionary longer than the 64 KiB window: only its tail is used, and
+	// a different prefix with the same tail is the same dictionary.
+	tail := bytes.Repeat([]byte("frame identity tail "), 8000) // > 64 KiB
+	dictA := append([]byte("prefix A "), tail...)
+	dictB := append([]byte("prefix B, different "), tail...)
+	src := bytes.Repeat([]byte("frame identity tail payload "), 1<<16) // several blocks
+
+	for _, bs := range []lz4.BlockSize{lz4.Block64Kb, lz4.Block256Kb, lz4.Block4Mb} {
+		t.Run(bs.String(), func(t *testing.T) {
+			frame := encode(t, src, lz4.BlockSizeOption(bs), lz4.DictionaryOption(dictA))
+			_, _, id, has := dictFrameInfo(t, frame)
+			if !has || id != lz4.DictID(tail) {
+				t.Fatalf("recorded ID %#x (has=%v), want %#x", id, has, lz4.DictID(tail))
+			}
+			// dictB shares the tail, so it is the same effective dictionary.
+			for _, d := range []struct {
+				name string
+				dict []byte
+			}{{"sameTail", dictB}, {"tail", tail}} {
+				zr := lz4.NewReader(bytes.NewReader(frame))
+				if err := zr.Apply(lz4.DictionaryOption(d.dict)); err != nil {
+					t.Fatal(err)
+				}
+				out, err := io.ReadAll(zr)
+				if err != nil || !bytes.Equal(out, src) {
+					t.Fatalf("%s: %d bytes, err %v", d.name, len(out), err)
+				}
+			}
+			// A dictionary whose effective (last 64 KiB) tail differs is
+			// rejected, even if its prefix matches.
+			bad := append([]byte{}, tail...)
+			bad[len(bad)-1] ^= 0xFF
+			zr := lz4.NewReader(bytes.NewReader(frame))
+			if err := zr.Apply(lz4.DictionaryOption(bad)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadAll(zr); !errors.Is(err, lz4.ErrDictionaryMismatch) {
+				t.Fatalf("different tail: got %v, want ErrDictionaryMismatch", err)
+			}
+		})
+	}
+
+	// Two concatenated frames with different dictionaries: each is checked
+	// against its own header before its payload is decoded.
+	srcA := []byte("payload for the first frame")
+	srcB := []byte("payload for the second frame")
+	dict1 := []byte("first dictionary")
+	dict2 := []byte("second dictionary")
+	stream := append(encode(t, srcA, lz4.DictionaryOption(dict1)), encode(t, srcB, lz4.DictionaryOption(dict2))...)
+
+	// The Reader has one dictionary, so the second frame must be rejected.
+	zr := lz4.NewReader(bytes.NewReader(stream))
+	if err := zr.Apply(lz4.DictionaryOption(dict1)); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(zr)
+	if !errors.Is(err, lz4.ErrDictionaryMismatch) {
+		t.Fatalf("second frame: got %v, want ErrDictionaryMismatch", err)
+	}
+	if !bytes.Equal(out, srcA) {
+		t.Fatalf("first frame decoded %q, want %q", out, srcA)
+	}
+
+	// Frames with the same dictionary in one stream decode together.
+	sameStream := append(encode(t, srcA, lz4.DictionaryOption(dict1)), encode(t, srcB, lz4.DictionaryOption(dict1))...)
+	for _, conc := range []int{1, 4} {
+		zr := lz4.NewReader(bytes.NewReader(sameStream))
+		if err := zr.Apply(lz4.DictionaryOption(dict1), lz4.ConcurrencyOption(conc)); err != nil {
+			t.Fatal(err)
+		}
+		out, err := io.ReadAll(zr)
+		if err != nil || !bytes.Equal(out, append(append([]byte{}, srcA...), srcB...)) {
+			t.Fatalf("conc=%d: %d bytes, err %v", conc, len(out), err)
+		}
 	}
 }
 

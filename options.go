@@ -267,7 +267,19 @@ func LegacyOption(legacy bool) Option {
 // Compression with a dictionary supports only the Fast level and non-legacy
 // frames: with any other CompressionLevelOption, or LegacyOption(true), on a
 // Writer or CompressingReader, either option returns ErrOptionNotApplicable.
+//
+// The dictionary is copied, so the caller may reuse or modify the slice after
+// the option returns, even while a Writer or Reader uses it. Only the last
+// 64 KiB is used; a longer dictionary equals one that shares its last 64 KiB.
+//
+// A Writer records in the frame the dictionary's identity (its DictID, from the
+// shared lz4block calculation) whenever the dictionary is non-empty. A Reader
+// checks that identity against the frame before decoding any data, so a missing
+// dictionary, or a different one, fails with ErrDictionaryRequired or
+// ErrDictionaryMismatch rather than producing wrong output.
 func DictionaryOption(dict []byte) Option {
+	// Clip and copy once: the closure may be applied to several objects, and
+	// each takes its own copy of this one.
 	dict = slices.Clip(bytes.Clone(dict))
 	return func(a applier) error {
 		switch rw := a.(type) {
@@ -278,7 +290,10 @@ func DictionaryOption(dict []byte) Option {
 			if len(dict) > 0 && (rw.level != lz4block.Fast || rw.legacy) {
 				return lz4errors.ErrOptionNotApplicable
 			}
-			rw.dict = dict
+			// Copy again: each object owns its dictionary, so resetting or
+			// reusing another object cannot change it, and a Reader's rolling
+			// dictionary for linked blocks starts from a fresh copy.
+			rw.dict = slices.Clone(dict)
 			if len(dict) > 0 {
 				if rw.compressor == nil {
 					rw.compressor = new(lz4block.Compressor)
@@ -288,14 +303,14 @@ func DictionaryOption(dict []byte) Option {
 			}
 			return nil
 		case *Reader:
-			rw.presetDict = slices.Clip(bytes.Clone(dict))
+			rw.presetDict = slices.Clone(dict)
 			rw.dict = rw.presetDict
 			return nil
 		case *CompressingReader:
 			if len(dict) > 0 && rw.level != lz4block.Fast {
 				return lz4errors.ErrOptionNotApplicable
 			}
-			rw.dict = dict
+			rw.dict = slices.Clone(dict)
 			if len(dict) > 0 {
 				if rw.compressor == nil {
 					rw.compressor = new(lz4block.Compressor)

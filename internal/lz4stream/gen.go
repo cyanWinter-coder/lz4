@@ -16,7 +16,8 @@ import (
 
 type DescriptorFlags struct {
 	// FLG
-	_                 [2]int
+	DictID            [1]bool
+	_                 [1]int
 	ContentChecksum   [1]bool
 	Size              [1]bool
 	BlockChecksum     [1]bool

@@ -20,4 +20,10 @@ const (
 	ErrEndOfStream                   Error = "lz4: end of stream reached"
 	ErrInvalidFrameDescriptor        Error = "lz4: invalid or unsupported frame descriptor"
 	ErrInvalidContentSize            Error = "lz4: content size mismatch"
+	// ErrDictionaryMismatch is returned when a frame records a dictionary
+	// identity that differs from the Reader's dictionary.
+	ErrDictionaryMismatch Error = "lz4: dictionary mismatch"
+	// ErrDictionaryRequired is returned when a frame records a dictionary
+	// that the Reader was not given.
+	ErrDictionaryRequired Error = "lz4: frame requires a dictionary"
 )

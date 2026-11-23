@@ -16,6 +16,10 @@ const (
 	winSize    = 1 << winSizeLog
 	winMask    = winSize - 1 // 64Kb window of previous data for dependent blocks
 
+	// MaxDictSize is the number of dictionary bytes that compression and
+	// decompression use: the last MaxDictSize bytes of the dictionary.
+	MaxDictSize = winSize
+
 	// hashLog determines the size of the hash table used to quickly find a previous match position.
 	// Its value influences the compression speed and memory usage, the lower the faster,
 	// but at the expense of the compression ratio.

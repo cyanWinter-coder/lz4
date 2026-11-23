@@ -81,6 +81,20 @@ func FuzzBlockRoundTrip(f *testing.F) {
 		f.Add(b, []byte(nil))
 	}
 	f.Fuzz(func(t *testing.T, data, dict []byte) {
+		// The identity is a pure function of the effective dictionary: equal
+		// dictionaries give equal IDs, and only the last MaxDictSize bytes
+		// matter.
+		id := DictID(dict)
+		tail := dict
+		if len(tail) > MaxDictSize {
+			tail = tail[len(tail)-MaxDictSize:]
+		}
+		if got := DictID(tail); got != id {
+			t.Fatalf("DictID(%d bytes)=%#x, DictID(tail %d bytes)=%#x", len(dict), id, len(tail), got)
+		}
+		if (id == 0) != (len(tail) == 0) {
+			t.Fatalf("DictID=%#x for %d-byte effective dictionary; 0 means none", id, len(tail))
+		}
 		comp := make([]byte, CompressBlockBound(len(data)))
 		var c Compressor
 		n, err := c.CompressBlockWithDict(data, comp, dict)

@@ -24,7 +24,7 @@ func NewFrame() *Frame {
 }
 
 type Frame struct {
-	buf        [15]byte // frame descriptor needs at most 2(flags)+8(size)+4(dict id)+1(checksum)=15 bytes
+	buf        [19]byte // magic (4) + frame descriptor: 2(flags)+8(size)+4(dict id)+1(checksum)
 	Magic      uint32
 	Descriptor FrameDescriptor
 	Blocks     Blocks
@@ -48,6 +48,7 @@ func (f *Frame) Reset(num int) {
 	f.Magic = 0
 	f.Descriptor.Checksum = 0
 	f.Descriptor.ContentSize = 0
+	f.Descriptor.DictID = 0
 	_ = f.Blocks.close(f, num)
 	f.Checksum = 0
 }
@@ -164,6 +165,7 @@ func (f *Frame) CloseR(src io.Reader) (err error) {
 type FrameDescriptor struct {
 	Flags       DescriptorFlags
 	ContentSize uint64
+	DictID      uint32 // 0 when the descriptor has none
 	Checksum    uint8
 }
 
@@ -189,6 +191,10 @@ func (fd *FrameDescriptor) Write(f *Frame, dst io.Writer) error {
 			buf = buf[:4+2+8]
 			binary.LittleEndian.PutUint64(buf[4+2:], fd.ContentSize)
 		}
+		if fd.Flags.DictID() {
+			buf = append(buf, 0, 0, 0, 0)
+			binary.LittleEndian.PutUint32(buf[len(buf)-4:], fd.DictID)
+		}
 		fd.Checksum = descriptorChecksum(buf[4:])
 		buf = append(buf, fd.Checksum)
 	}
@@ -198,6 +204,7 @@ func (fd *FrameDescriptor) Write(f *Frame, dst io.Writer) error {
 }
 
 func (fd *FrameDescriptor) initR(f *Frame, src io.Reader) error {
+	fd.DictID = 0
 	if f.isLegacy() {
 		fd.Flags = 0 // no descriptor to read: clear whatever the previous frame left
 		return nil
@@ -214,7 +221,7 @@ func (fd *FrameDescriptor) initR(f *Frame, src io.Reader) error {
 	if fd.Flags.Size() {
 		extra += 8
 	}
-	if fd.Flags.dictID() {
+	if fd.Flags.DictID() {
 		extra += 4
 	}
 	if extra > 0 {
@@ -225,6 +232,9 @@ func (fd *FrameDescriptor) initR(f *Frame, src io.Reader) error {
 	}
 	if fd.Flags.Size() {
 		fd.ContentSize = binary.LittleEndian.Uint64(buf[2:])
+	}
+	if fd.Flags.DictID() {
+		fd.DictID = binary.LittleEndian.Uint32(buf[len(buf)-5:])
 	}
 	fd.Checksum = buf[len(buf)-1] // the checksum is the last byte
 	buf = buf[:len(buf)-1]        // all descriptor fields except checksum
@@ -238,11 +248,6 @@ func (fd *FrameDescriptor) initR(f *Frame, src io.Reader) error {
 	if fd.Flags&descriptorReserved != 0 {
 		return fmt.Errorf("%w: reserved bits %#04x set", lz4errors.ErrInvalidFrameDescriptor, uint16(fd.Flags&descriptorReserved))
 	}
-	if fd.Flags.dictID() {
-		// Frame dictionaries are not supported: decoding without one would
-		// produce garbage.
-		return fmt.Errorf("%w: dictionary ID %#x", lz4errors.ErrInvalidFrameDescriptor, binary.LittleEndian.Uint32(buf[len(buf)-4:]))
-	}
 	if idx := fd.Flags.BlockSizeIndex(); !idx.IsValid() {
 		return lz4errors.ErrOptionInvalidBlockSize
 	}
@@ -250,14 +255,8 @@ func (fd *FrameDescriptor) initR(f *Frame, src io.Reader) error {
 }
 
 // Bits of the FLG (low) and BD (high) descriptor bytes that the format
-// reserves, and the dictionary ID flag, which the generated DescriptorFlags
-// accessors leave out.
-const (
-	descriptorReserved DescriptorFlags = 1<<1 | 0xF<<8 | 1<<15
-	descriptorDictID   DescriptorFlags = 1 << 0
-)
-
-func (x DescriptorFlags) dictID() bool { return x&descriptorDictID != 0 }
+// reserves or that the generated DescriptorFlags accessors handle.
+const descriptorReserved DescriptorFlags = 1<<1 | 0xF<<8 | 1<<15
 
 func descriptorChecksum(buf []byte) byte {
 	return byte(xxh32.ChecksumZero(buf) >> 8)

@@ -2,6 +2,7 @@ package lz4stream
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"testing"
@@ -58,6 +59,94 @@ func TestFrameDescriptor(t *testing.T) {
 				t.Fatalf("got %q; want %q\n", got, want)
 			}
 		})
+	}
+}
+
+// A descriptor with a dictionary ID writes it after the content size and reads
+// it back, in either order of the optional fields, and the header checksum
+// covers it.
+func TestFrameDescriptorDictID(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		size   uint64
+		hasSeq bool
+		dictID uint32
+	}{
+		{"dictOnly", 0, false, 0x01020304},
+		{"dictAndSize", 1234, true, 0xDEADBEEF},
+		{"maxID", 0, false, 0xFFFFFFFF},
+		{"sizeOnly", 7, true, 0},
+		{"none", 0, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Write.
+			f := NewFrame()
+			f.Magic = frameMagic
+			f.Descriptor.Flags.BlockSizeIndexSet(lz4block.Index(lz4block.Block64Kb))
+			f.Descriptor.initW()
+			f.Descriptor.Flags.SizeSet(tc.hasSeq)
+			f.Descriptor.ContentSize = tc.size
+			f.Descriptor.Flags.DictIDSet(tc.dictID != 0)
+			f.Descriptor.DictID = tc.dictID
+			buf := new(bytes.Buffer)
+			if err := f.Descriptor.Write(f, buf); err != nil {
+				t.Fatal(err)
+			}
+
+			want := tc.hasSeq || tc.dictID != 0
+			if got := f.Descriptor.Flags.DictID(); got != (tc.dictID != 0) {
+				t.Fatalf("DictID flag = %v", got)
+			}
+			if want && tc.dictID != 0 {
+				// The ID sits right before the header checksum.
+				b := buf.Bytes()
+				if got := binary.LittleEndian.Uint32(b[len(b)-5:]); got != tc.dictID {
+					t.Fatalf("wrote dict ID %#x, want %#x", got, tc.dictID)
+				}
+			}
+
+			// Read it back, skipping the magic.
+			rf := NewFrame()
+			rf.Magic = frameMagic
+			var fd FrameDescriptor
+			if err := fd.initR(rf, bytes.NewReader(buf.Bytes()[4:])); err != nil {
+				t.Fatal(err)
+			}
+			if got := fd.Flags.DictID(); got != (tc.dictID != 0) {
+				t.Fatalf("read DictID flag = %v, want %v", got, tc.dictID != 0)
+			}
+			if fd.DictID != tc.dictID {
+				t.Fatalf("read dict ID %#x, want %#x", fd.DictID, tc.dictID)
+			}
+			if fd.Flags.Size() != tc.hasSeq || (tc.hasSeq && fd.ContentSize != tc.size) {
+				t.Fatalf("read size flag=%v size=%d, want flag=%v size=%d", fd.Flags.Size(), fd.ContentSize, tc.hasSeq, tc.size)
+			}
+		})
+	}
+}
+
+// A descriptor whose dictionary ID is corrupted fails the header checksum
+// check, since the checksum covers the optional fields.
+func TestFrameDescriptorDictIDChecksum(t *testing.T) {
+	f := NewFrame()
+	f.Magic = frameMagic
+	f.Descriptor.initW()
+	f.Descriptor.Flags.DictIDSet(true)
+	f.Descriptor.DictID = 0x11223344
+	buf := new(bytes.Buffer)
+	if err := f.Descriptor.Write(f, buf); err != nil {
+		t.Fatal(err)
+	}
+	desc := buf.Bytes()[4:]
+	for i := 0; i < len(desc)-1; i++ { // every byte but the checksum
+		bad := append([]byte{}, desc...)
+		bad[i] ^= 0x80
+		rf := NewFrame()
+		rf.Magic = frameMagic
+		var fd FrameDescriptor
+		if err := fd.initR(rf, bytes.NewReader(bad)); err == nil {
+			t.Fatalf("byte %d corrupted, read without error", i)
+		}
 	}
 }
 

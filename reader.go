@@ -2,8 +2,8 @@ package lz4
 
 import (
 	"bytes"
+	"fmt"
 	"io"
-	"slices"
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
 	"github.com/pierrec/lz4/v4/internal/lz4errors"
@@ -44,6 +44,7 @@ type Reader struct {
 	cum        uint32
 	dict       []byte
 	presetDict []byte
+	dictID     uint32 // identity recorded by the current or last frame
 }
 
 func (*Reader) private() {}
@@ -76,6 +77,19 @@ func (r *Reader) Size() int {
 	return 0
 }
 
+// DictID returns the dictionary identity the current frame records, or 0 if
+// it records none, which is the case when it was made without a dictionary or
+// by an implementation that does not record one. It is meaningful once a Read
+// or WriteTo has parsed the frame header, and 0 before that and after Reset.
+// It keeps the last frame's identity after a read reaches the end of that
+// frame, until a Reset or the next frame's header.
+//
+// The Reader checks this identity against its own dictionary before decoding
+// any data, so a successful Read guarantees that it matched.
+func (r *Reader) DictID() uint32 {
+	return r.dictID
+}
+
 func (r *Reader) isNotConcurrent() bool {
 	return r.num == 1
 }
@@ -86,6 +100,9 @@ func (r *Reader) init() error {
 	}
 	err := r.frame.ParseHeaders(r.src)
 	if err != nil {
+		return err
+	}
+	if err := r.checkDict(); err != nil {
 		return err
 	}
 	if !r.frame.Descriptor.Flags.BlockIndependence() {
@@ -102,6 +119,25 @@ func (r *Reader) init() error {
 	size := r.frame.BlockSizeIndex()
 	r.data = size.Get()
 	r.cum = 0
+	return nil
+}
+
+// checkDict verifies that r's dictionary is the one the frame was made with
+// before any of its payload is consumed. A frame that records a non-zero
+// dictionary ID needs a dictionary with that ID: decoding without one, or with
+// another, would produce wrong output rather than an error. An ID of 0 means
+// the same as no dictionary ID, as the format defines it, so such a frame
+// decodes without one.
+func (r *Reader) checkDict() error {
+	fd := &r.frame.Descriptor
+	r.dictID = fd.DictID
+	switch {
+	case fd.Flags.DictID() && fd.DictID != 0 && len(r.dict) == 0:
+		return fmt.Errorf("%w: frame dictionary ID %#x", lz4errors.ErrDictionaryRequired, fd.DictID)
+	case fd.Flags.DictID() && fd.DictID != 0 && lz4block.DictID(r.dict) != fd.DictID:
+		return fmt.Errorf("%w: frame dictionary ID %#x; supplied dictionary ID %#x",
+			lz4errors.ErrDictionaryMismatch, fd.DictID, lz4block.DictID(r.dict))
+	}
 	return nil
 }
 
@@ -145,8 +181,9 @@ func (r *Reader) Read(buf []byte) (n int, err error) {
 					return
 				}
 
-				// Check for a new stream.
-				r.Reset(r.src)
+				// Check for a new stream. Keep the identity of the frame just
+				// read until the next frame's header replaces it.
+				r.reset(r.src, true)
 				if err = r.init(); r.state.next(err) {
 					return
 				}
@@ -228,13 +265,22 @@ func (r *Reader) read(buf []byte) (int, error) {
 // With concurrency, Reset waits for a read of the previous source that is in
 // progress to return; the previous source is then no longer used.
 func (r *Reader) Reset(reader io.Reader) {
+	r.reset(reader, false)
+}
+
+// reset is Reset; keepDictID keeps the identity of the frame just read so that
+// DictID reports it after the internal reset that follows a frame's end.
+func (r *Reader) reset(reader io.Reader, keepDictID bool) {
 	lz4block.Put(r.data)
 	r.data = nil
 	r.frame.Reset(r.num)
 	r.state.reset()
 	r.src = reader
 	r.reads = nil
-	r.dict = slices.Clip(bytes.Clone(r.presetDict))
+	r.dict = r.presetDict
+	if !keepDictID {
+		r.dictID = 0
+	}
 }
 
 // WriteTo efficiently uncompresses the data from the Reader underlying source to w.
@@ -302,8 +348,9 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 			if err != nil {
 				return
 			}
-			// Check for a new stream.
-			r.Reset(r.src)
+			// Check for a new stream. Keep the identity of the frame just
+			// read until the next frame's header replaces it.
+			r.reset(r.src, true)
 			if err = r.init(); r.state.next(err) {
 				if err == io.EOF {
 					err = nil

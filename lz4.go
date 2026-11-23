@@ -29,6 +29,25 @@ func CompressBlockBound(n int) int {
 	return lz4block.CompressBlockBound(n)
 }
 
+// MaxDictSize is the number of dictionary bytes that compression and
+// decompression use: the last MaxDictSize bytes of a dictionary. A dictionary
+// longer than that is equivalent to one made of its last MaxDictSize bytes.
+const MaxDictSize = lz4block.MaxDictSize
+
+// DictID returns the identity of dict that a Writer or CompressingReader
+// records in a frame's descriptor. It is a checksum of the dictionary's
+// length and its last MaxDictSize bytes, so dictionaries that share that tail
+// have the same identity. Equal identities mean equal effective dictionaries,
+// which is what lets a Reader reject a missing or different dictionary before
+// decoding any data.
+//
+// It is not a cryptographic checksum, and an empty dictionary has identity 0.
+// A frame made by another implementation, or by a version that did not record
+// dictionary identities, carries none, so its dictionary cannot be verified.
+func DictID(dict []byte) uint32 {
+	return lz4block.DictID(dict)
+}
+
 // UncompressBlock uncompresses the source buffer into the destination one,
 // and returns the uncompressed size.
 //
@@ -220,4 +239,10 @@ const (
 	// from the content size in its descriptor, or when writing a frame whose data differs
 	// from SizeOption.
 	ErrInvalidContentSize = lz4errors.ErrInvalidContentSize
+	// ErrDictionaryMismatch is returned, before any payload is decoded, when the dictionary
+	// supplied to a Reader has a different identity from the one the frame records.
+	ErrDictionaryMismatch = lz4errors.ErrDictionaryMismatch
+	// ErrDictionaryRequired is returned, before any payload is decoded, when the frame records
+	// a dictionary but the Reader has none.
+	ErrDictionaryRequired = lz4errors.ErrDictionaryRequired
 )

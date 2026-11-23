@@ -8,7 +8,8 @@ import "github.com/pierrec/lz4/v4/internal/lz4block"
 //
 //	field              bits
 //	-----              ----
-//	_                  2
+//	DictID             1
+//	_                  1
 //	ContentChecksum    1
 //	Size               1
 //	BlockChecksum      1
@@ -20,6 +21,7 @@ import "github.com/pierrec/lz4/v4/internal/lz4block"
 type DescriptorFlags uint16
 
 // Getters.
+func (x DescriptorFlags) DictID() bool            { return x&1 != 0 }
 func (x DescriptorFlags) ContentChecksum() bool   { return x>>2&1 != 0 }
 func (x DescriptorFlags) Size() bool              { return x>>3&1 != 0 }
 func (x DescriptorFlags) BlockChecksum() bool     { return x>>4&1 != 0 }
@@ -30,6 +32,14 @@ func (x DescriptorFlags) BlockSizeIndex() lz4block.BlockSizeIndex {
 }
 
 // Setters.
+func (x *DescriptorFlags) DictIDSet(v bool) *DescriptorFlags {
+	if v {
+		*x |= 1
+	} else {
+		*x &^= 1
+	}
+	return x
+}
 func (x *DescriptorFlags) ContentChecksumSet(v bool) *DescriptorFlags {
 	const b = 1 << 2
 	if v {

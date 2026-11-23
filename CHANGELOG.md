@@ -19,8 +19,21 @@ issues in this repository.
   and `Reader`, and `CompressBlockWithDict`, as a function and a `Compressor`
   method, compresses a block with one. Compressing with a dictionary supports
   only the `Fast` level and non-legacy frames, uses the last 64 KiB of the
-  dictionary, and turns off concurrency. Frames do not record a dictionary ID,
-  so the reader needs the same dictionary (#286).
+  dictionary, and turns off concurrency.
+
+  A `Writer` or `CompressingReader` now records the dictionary's identity in
+  the frame's descriptor (the format's dictionary-ID field) whenever it
+  compresses with one, and `DictID` returns that identity. A `Reader` checks
+  it before decoding any block, so a frame that needs a dictionary that is
+  missing, or that differs, fails with `ErrDictionaryRequired` or
+  `ErrDictionaryMismatch` instead of producing wrong output. Previously no
+  identity was recorded and the reader had to trust the dictionary silently
+  (#286).
+- `Reader.DictID` reports the dictionary identity the current (or last) frame
+  records, or 0 if it records none. A frame that records identity 0, which the
+  format defines as no dictionary ID, decodes without one. Frames that record
+  none, including those from the C implementation and from earlier versions,
+  still decode as before and cannot be verified.
 
 ### Fixed
 

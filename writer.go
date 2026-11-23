@@ -37,7 +37,7 @@ type Writer struct {
 	idx        int                       // size of pending data
 	handler    func(int)
 	legacy     bool
-	dict       []byte
+	dict       []byte // dictionary in use; a copy owned by the Writer
 	compressor *lz4block.Compressor
 }
 
@@ -67,11 +67,20 @@ func (w *Writer) isNotConcurrent() bool {
 
 // init sets up the Writer when in newState. It does not change the Writer state.
 func (w *Writer) init() error {
-	if len(w.dict) > 0 {
+	// Record which dictionary the frame needs, so that a reader with a
+	// different one fails instead of decoding garbage. Legacy frames have no
+	// descriptor; LegacyOption rejects a dictionary, so this only matters if
+	// options were applied despite an error.
+	hasDict := len(w.dict) > 0 && !w.legacy
+	w.frame.Descriptor.Flags.DictIDSet(hasDict)
+	if hasDict {
 		w.num = 1
 		if w.compressor == nil {
 			w.compressor = new(lz4block.Compressor)
 		}
+		w.frame.Descriptor.DictID = lz4block.DictID(w.dict)
+	} else {
+		w.frame.Descriptor.DictID = 0
 	}
 	if !w.legacy && !w.frame.Descriptor.Flags.BlockSizeIndex().IsValid() {
 		// Block8Mb is only valid in legacy frames, and LegacyOption may be

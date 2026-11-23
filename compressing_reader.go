@@ -79,6 +79,14 @@ func (zrd *CompressingReader) init() error {
 	if len(zrd.dict) > 0 && zrd.compressor == nil {
 		zrd.compressor = new(lz4block.Compressor)
 	}
+	// Record which dictionary the frame needs, so that a reader with a
+	// different one fails instead of decoding garbage.
+	zrd.frame.Descriptor.Flags.DictIDSet(len(zrd.dict) > 0)
+	if len(zrd.dict) > 0 {
+		zrd.frame.Descriptor.DictID = lz4block.DictID(zrd.dict)
+	} else {
+		zrd.frame.Descriptor.DictID = 0
+	}
 	zrd.frame.InitW(&zrd.out, 1, false)
 	size := zrd.frame.BlockSizeIndex()
 	zrd.in = size.Get()
